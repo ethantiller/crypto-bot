@@ -28,6 +28,7 @@ class CryptoTradingBot:
         self.load_config()
         self.positions = {}
         self.trade_history = []
+        self.discord_webhook_url = "https://discordapp.com/api/webhooks/1403453073485070527/P50wqbjUl9OHODBe1IoRNzT7jQ_ObpRhQQE-K50AfRB0m-utkNApo2UKA_HnMnF3jy0W"
         
     def setup_logging(self):
         """Setup logging configuration"""
@@ -40,6 +41,33 @@ class CryptoTradingBot:
             ]
         )
         self.logger = logging.getLogger(__name__)
+        
+    def send_discord_notification(self, message, color=None):
+        """Send notification to Discord webhook"""
+        try:
+            if not self.discord_webhook_url:
+                return
+                
+            # Create embed for better formatting
+            embed = {
+                "title": "🤖 Crypto Trading Bot",
+                "description": message,
+                "timestamp": datetime.now().isoformat(),
+                "color": color or 0x00ff00  # Default green
+            }
+            
+            payload = {
+                "embeds": [embed]
+            }
+            
+            response = requests.post(self.discord_webhook_url, json=payload, timeout=10)
+            if response.status_code == 204:
+                self.logger.info("Discord notification sent successfully")
+            else:
+                self.logger.warning(f"Discord notification failed: {response.status_code}")
+                
+        except Exception as e:
+            self.logger.error(f"Error sending Discord notification: {e}")
         
     def setup_exchange(self):
         """Initialize Kraken exchange connection"""
@@ -155,6 +183,15 @@ class CryptoTradingBot:
             if self.config['paper_trading']:
                 self.logger.info(f"[PAPER TRADING] {side.upper()} {amount:.6f} {symbol} at ${price:.2f}")
                 
+                # Send Discord notification for paper trades
+                self.send_discord_notification(
+                    f"📝 **PAPER TRADE**\n"
+                    f"**{side.upper()}** {amount:.6f} {symbol}\n"
+                    f"Price: ${price:.2f}\n"
+                    f"Value: ${amount * price:.2f}",
+                    color=0xffaa00  # Orange for paper trades
+                )
+                
                 # Create fake order for logging
                 order = {
                     'id': f"paper_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
@@ -169,6 +206,17 @@ class CryptoTradingBot:
                 # Real trading - place actual market order
                 order = self.exchange.create_market_order(symbol, side, amount)
                 self.logger.info(f"[LIVE TRADING] Order placed: {side} {amount:.6f} {symbol} - Order ID: {order['id']}")
+                
+                # Send Discord notification for live trades
+                trade_value = amount * price
+                self.send_discord_notification(
+                    f"💰 **LIVE TRADE EXECUTED**\n"
+                    f"**{side.upper()}** {amount:.6f} {symbol}\n"
+                    f"Price: ${price:.2f}\n"
+                    f"Value: ${trade_value:.2f}\n"
+                    f"Order ID: {order['id']}",
+                    color=0x00ff00 if side == 'buy' else 0xff0000  # Green for buy, red for sell
+                )
                 
             # Log trade
             trade_record = {
@@ -202,11 +250,31 @@ class CryptoTradingBot:
                 # Check stop loss
                 if pnl_pct <= -self.config['stop_loss_pct']:
                     self.logger.info(f"Stop loss triggered for {symbol}: {pnl_pct:.3f}%")
+                    
+                    # Send Discord notification for stop loss
+                    self.send_discord_notification(
+                        f"🛑 **STOP LOSS TRIGGERED**\n"
+                        f"Symbol: {symbol}\n"
+                        f"Entry Price: ${entry_price:.2f}\n"
+                        f"Current Price: ${current_price:.2f}\n"
+                        f"Loss: {pnl_pct:.2%}",
+                        color=0xff0000  # Red for stop loss
+                    )
                     return 'sell'
                     
                 # Check take profit
                 if pnl_pct >= self.config['take_profit_pct']:
                     self.logger.info(f"Take profit triggered for {symbol}: {pnl_pct:.3f}%")
+                    
+                    # Send Discord notification for take profit
+                    self.send_discord_notification(
+                        f"🎯 **TAKE PROFIT TRIGGERED**\n"
+                        f"Symbol: {symbol}\n"
+                        f"Entry Price: ${entry_price:.2f}\n"
+                        f"Current Price: ${current_price:.2f}\n"
+                        f"Profit: {pnl_pct:.2%}",
+                        color=0x00ff00  # Green for take profit
+                    )
                     return 'sell'
                     
         except Exception as e:
@@ -260,7 +328,23 @@ class CryptoTradingBot:
                 # Check sell signal
                 if signals['sell']:
                     self.logger.info(f"Sell signal for {symbol}")
+                    
+                    # Send Discord notification for sell signal
                     amount = self.positions[symbol]['amount']
+                    entry_price = self.positions[symbol]['entry_price']
+                    current_price = signals['price']
+                    pnl_pct = (current_price - entry_price) / entry_price
+                    
+                    self.send_discord_notification(
+                        f"📉 **SELL SIGNAL DETECTED**\n"
+                        f"Symbol: {symbol}\n"
+                        f"Entry Price: ${entry_price:.2f}\n"
+                        f"Current Price: ${current_price:.2f}\n"
+                        f"P&L: {pnl_pct:.2%}\n"
+                        f"RSI: {signals['rsi']:.1f}",
+                        color=0xff6600  # Orange for sell signal
+                    )
+                    
                     order = self.place_order(symbol, 'sell', amount, signals['price'])
                     if order:
                         del self.positions[symbol]
@@ -269,6 +353,18 @@ class CryptoTradingBot:
                 # Check buy signal
                 if signals['buy']:
                     self.logger.info(f"Buy signal for {symbol}")
+                    
+                    # Send Discord notification for buy signal
+                    self.send_discord_notification(
+                        f"📈 **BUY SIGNAL DETECTED**\n"
+                        f"Symbol: {symbol}\n"
+                        f"Price: ${signals['price']:.2f}\n"
+                        f"RSI: {signals['rsi']:.1f}\n"
+                        f"MA Short: ${signals['ma_short']:.2f}\n"
+                        f"MA Long: ${signals['ma_long']:.2f}",
+                        color=0x00aa00  # Green for buy signal
+                    )
+                    
                     amount = self.calculate_position_size(symbol, signals['price'])
                     if amount > 0:
                         order = self.place_order(symbol, 'buy', amount, signals['price'])
@@ -311,8 +407,24 @@ class CryptoTradingBot:
         """Main bot loop"""
         if self.config['paper_trading']:
             self.logger.info("[PAPER] Starting Crypto Trading Bot in PAPER TRADING MODE (no real money)")
+            # Send Discord startup notification
+            self.send_discord_notification(
+                f"🟡 **BOT STARTED - PAPER TRADING MODE**\n"
+                f"Symbols: {', '.join(self.config['symbols'])}\n"
+                f"Check Interval: {self.config['check_interval']}s\n"
+                f"⚠️ No real money will be used",
+                color=0xffaa00  # Orange for paper trading
+            )
         else:
             self.logger.info("[LIVE] Starting Crypto Trading Bot in LIVE TRADING MODE (real money)")
+            # Send Discord startup notification
+            self.send_discord_notification(
+                f"🟢 **BOT STARTED - LIVE TRADING MODE**\n"
+                f"Symbols: {', '.join(self.config['symbols'])}\n"
+                f"Check Interval: {self.config['check_interval']}s\n"
+                f"💰 Real money trading active!",
+                color=0x00ff00  # Green for live trading
+            )
             
         self.load_state()
         
@@ -331,8 +443,19 @@ class CryptoTradingBot:
                 
         except KeyboardInterrupt:
             self.logger.info("Bot stopped by user")
+            self.send_discord_notification(
+                "🔴 **BOT STOPPED**\n"
+                "Bot manually stopped by user",
+                color=0xff0000  # Red for stop
+            )
         except Exception as e:
             self.logger.error(f"Bot error: {e}")
+            self.send_discord_notification(
+                f"❌ **BOT ERROR**\n"
+                f"Error: {str(e)}\n"
+                f"Bot may have crashed!",
+                color=0xff0000  # Red for error
+            )
             raise
         finally:
             self.save_state()
