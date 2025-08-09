@@ -112,8 +112,8 @@ class CryptoTradingBot:
             'take_profit_pct': 0.03,    # 3% take profit (faster profit capture)
             'trailing_stop_pct': 0.015, # 1.5% trailing stop to protect profits
             'volume_ma_period': 20,     # Volume moving average for confirmation
-            'volume_threshold': 1.2,    # Volume must be 1.2x above average
-            'momentum_periods': 3,      # Price must be above both MAs for X periods
+            'volume_threshold': 0.8,    # Volume must be 0.8x above average (more realistic)
+            'momentum_periods': 2,      # Price must be above both MAs for X periods (reduced)
             'max_hold_hours': 24,       # Maximum hold time in hours
             'max_drawdown_pct': 0.10,   # 10% max portfolio drawdown (emergency stop)
             'daily_loss_limit_pct': 0.05, # 5% daily loss limit
