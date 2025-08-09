@@ -106,7 +106,7 @@ class CryptoTradingBot:
             'long_ma_period': 30,   # Long moving average
             'rsi_period': 14,       # RSI period
             'rsi_entry_threshold': 65,  # RSI entry filter (buy when RSI < 65) - more selective
-            'rsi_exit_threshold': 75,   # RSI exit filter (sell when RSI > 75)
+            'rsi_exit_threshold': 70,   # RSI exit filter (sell when RSI > 75)
             'position_size_pct': 0.3333,  # 33.33% (one-third) of portfolio per trade
             'stop_loss_pct': 0.04,      # 4% stop loss (within 3-5% range)
             'take_profit_pct': 0.03,    # 3% take profit (faster profit capture)
