@@ -149,9 +149,10 @@ class CryptoTradingBot:
         safe_uptrend = ma_uptrend and price_not_extended and meaningful_trend
         buy_signal = (ma_cross_up or safe_uptrend) and latest['rsi'] < self.config['rsi_entry_threshold']
         
-        # Sell signal: MA crossover down (short MA crosses below long MA) OR RSI > threshold
+        # Sell signal: MA crossover down (short MA crosses below long MA) OR RSI > threshold OR weak trend
         ma_cross_down = (previous['ma_short'] >= previous['ma_long']) and (latest['ma_short'] < latest['ma_long'])
-        sell_signal = ma_cross_down or latest['rsi'] > self.config['rsi_exit_threshold']
+        weak_trend = (latest['ma_short'] - latest['ma_long']) / latest['ma_long'] < 0.001  # 0.1% gap - trend weakening
+        sell_signal = ma_cross_down or latest['rsi'] > self.config['rsi_exit_threshold'] or weak_trend
         
         return {
             'buy': buy_signal,
