@@ -103,10 +103,10 @@ class CryptoTradingBot:
             'rsi_period': 14,       # RSI period
             'rsi_entry_threshold': 70,  # RSI entry filter (buy when RSI < 70)
             'rsi_exit_threshold': 75,   # RSI exit filter (sell when RSI > 75)
-            'position_size_pct': 0.075,  # 7.5% of portfolio per trade (within 5-10% range)
+            'position_size_pct': 0.20,  # 20% of portfolio per trade (increased for small balance)
             'stop_loss_pct': 0.04,      # 4% stop loss (within 3-5% range)
             'take_profit_pct': 0.10,    # 10% take profit (within 8-12% range)
-            'min_trade_amount': 7,      # Minimum trade amount in USD (adjusted for current balance)
+            'min_trade_amount': 15,     # Minimum trade amount in USD (matches Bitcoin minimum)
             'check_interval': 300,      # Check every 5 minutes
             'paper_trading': os.getenv('PAPER_TRADING', 'True').lower() == 'true',  # Paper trading mode
         }
