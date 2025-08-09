@@ -5,3 +5,4 @@ __pycache__/
 bot_state.json
 venv/
 .vscode/
+*.pem

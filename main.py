@@ -101,12 +101,12 @@ class CryptoTradingBot:
             'short_ma_period': 10,  # Short moving average
             'long_ma_period': 30,   # Long moving average
             'rsi_period': 14,       # RSI period
-            'rsi_entry_threshold': 65,  # RSI entry filter (buy when RSI < 65)
-            'rsi_exit_threshold': 70,   # RSI exit filter (sell when RSI > 70)
+            'rsi_entry_threshold': 70,  # RSI entry filter (buy when RSI < 70)
+            'rsi_exit_threshold': 75,   # RSI exit filter (sell when RSI > 75)
             'position_size_pct': 0.075,  # 7.5% of portfolio per trade (within 5-10% range)
             'stop_loss_pct': 0.04,      # 4% stop loss (within 3-5% range)
             'take_profit_pct': 0.10,    # 10% take profit (within 8-12% range)
-            'min_trade_amount': 10,     # Minimum trade amount in USD
+            'min_trade_amount': 7,      # Minimum trade amount in USD (adjusted for current balance)
             'check_interval': 300,      # Check every 5 minutes
             'paper_trading': os.getenv('PAPER_TRADING', 'True').lower() == 'true',  # Paper trading mode
         }
@@ -133,7 +133,21 @@ class CryptoTradingBot:
         
         # Buy signal: MA crossover up (short MA crosses above long MA) AND RSI < threshold
         ma_cross_up = (previous['ma_short'] <= previous['ma_long']) and (latest['ma_short'] > latest['ma_long'])
-        buy_signal = ma_cross_up and latest['rsi'] < self.config['rsi_entry_threshold']
+        
+        # Trend-following logic with safety checks
+        ma_uptrend = latest['ma_short'] > latest['ma_long']
+        # Safety: Don't buy if price is too extended above short MA (avoid buying tops)
+        price_not_extended = latest['close'] <= (latest['ma_short'] * 1.03)  # Within 3% of short MA
+        # Safety: Ensure we have a meaningful trend (short MA sufficiently above long MA)
+        meaningful_trend = (latest['ma_short'] - latest['ma_long']) / latest['ma_long'] >= 0.0025  # 0.25% gap minimum
+        
+        # Debug trend-following conditions
+        ma_gap_pct = (latest['ma_short'] - latest['ma_long']) / latest['ma_long'] * 100
+        price_ext_pct = (latest['close'] - latest['ma_short']) / latest['ma_short'] * 100
+        
+        # Combined buy signal with safety checks
+        safe_uptrend = ma_uptrend and price_not_extended and meaningful_trend
+        buy_signal = (ma_cross_up or safe_uptrend) and latest['rsi'] < self.config['rsi_entry_threshold']
         
         # Sell signal: MA crossover down (short MA crosses below long MA) OR RSI > threshold
         ma_cross_down = (previous['ma_short'] >= previous['ma_long']) and (latest['ma_short'] < latest['ma_long'])
@@ -147,16 +161,25 @@ class CryptoTradingBot:
             'ma_short': latest['ma_short'],
             'ma_long': latest['ma_long'],
             'ma_cross_up': ma_cross_up,
-            'ma_cross_down': ma_cross_down
+            'ma_cross_down': ma_cross_down,
+            'safe_uptrend': safe_uptrend,
+            'ma_uptrend': ma_uptrend,
+            'price_not_extended': price_not_extended,
+            'meaningful_trend': meaningful_trend,
+            'ma_gap_pct': ma_gap_pct,
+            'price_ext_pct': price_ext_pct
         }
         
     def calculate_position_size(self, symbol, price):
         """Calculate position size based on portfolio percentage"""
         try:
             balance = self.exchange.fetch_balance()
-            # Kraken uses 'ZUSD' for USD balances
-            usd_key = 'ZUSD'
+            # Use 'USD' key for USD balances (ccxt normalizes this)
+            usd_key = 'USD'
             available_balance = balance['total'].get(usd_key, 0)
+            
+            # Log available balance for debugging
+            self.logger.info(f"Available USD balance: ${available_balance:.2f}")
                 
             position_value = available_balance * self.config['position_size_pct']
             quantity = position_value / price
@@ -165,7 +188,13 @@ class CryptoTradingBot:
             if position_value < self.config['min_trade_amount']:
                 self.logger.warning(f"Position value ${position_value:.2f} below minimum ${self.config['min_trade_amount']}")
                 return 0
+            
+            # Check if we have sufficient balance (with small buffer for fees)
+            if position_value > (available_balance * 0.98):  # Leave 2% buffer for fees
+                self.logger.warning(f"Insufficient balance: need ${position_value:.2f}, have ${available_balance:.2f}")
+                return 0
                 
+            self.logger.info(f"Position size: ${position_value:.2f} ({quantity:.6f} {symbol.split('/')[0]})")
             return quantity
             
         except Exception as e:
@@ -177,6 +206,20 @@ class CryptoTradingBot:
         try:
             if amount <= 0:
                 self.logger.warning(f"Invalid amount for {symbol}: {amount}")
+                return None
+            
+            # Round amount to appropriate precision for the trading pair
+            # Most crypto pairs need 6-8 decimal places
+            if symbol.startswith('BTC'):
+                amount = round(amount, 8)  # BTC uses 8 decimals
+            elif symbol.startswith('ETH'):
+                amount = round(amount, 6)  # ETH uses 6 decimals
+            else:
+                amount = round(amount, 6)  # Default to 6 decimals for other coins
+            
+            # Double-check amount is still valid after rounding
+            if amount <= 0:
+                self.logger.warning(f"Amount too small after rounding for {symbol}: {amount}")
                 return None
             
             # Paper trading mode - simulate orders without real trades
@@ -309,8 +352,14 @@ class CryptoTradingBot:
             signals = self.generate_signals(df)
             
             self.logger.info(f"{symbol} - Price: ${signals['price']:.2f}, RSI: {signals['rsi']:.1f}, "
-                           f"MA Short: ${signals['ma_short']:.2f}, MA Long: ${signals['ma_long']:.2f}, "
-                           f"Cross Up: {signals.get('ma_cross_up', False)}, Cross Down: {signals.get('ma_cross_down', False)}")
+                           f"MA Short: ${signals['ma_short']:.2f}, MA Long: ${signals['ma_long']:.2f}")
+            self.logger.info(f"{symbol} DEBUG - MA Gap: {signals.get('ma_gap_pct', 0):.2f}%, "
+                           f"Price Ext: {signals.get('price_ext_pct', 0):.2f}%, "
+                           f"Uptrend: {signals.get('ma_uptrend', False)}, "
+                           f"Not Extended: {signals.get('price_not_extended', False)}, "
+                           f"Meaningful: {signals.get('meaningful_trend', False)}, "
+                           f"Safe Uptrend: {signals.get('safe_uptrend', False)}, "
+                           f"Buy: {signals.get('buy', False)}")
             
             # Check if we have an open position
             has_position = symbol in self.positions
