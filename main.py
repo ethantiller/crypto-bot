@@ -1,807 +1,1056 @@
 #!/usr/bin/env python3
 """
-Crypto Trading Bot with Moving Average Crossover + RSI Strategy
-Designed for Kraken exchange and AWS Lightsail deployment
+Full Crypto Trading Bot implementing:
+- EMA21/EMA50 cross on 1H with 4H confirmation
+- RSI14, MACD(12,26,9), Volume MA20, ATR14
+- 15m confirmation for entry execution
+- Position sizing with BTC/ETH min $16, ADA/XRP/SOL target 10% each
+- Max 3 concurrent positions, equal-weight protection, stop/take/partial/trailing
+- Discord notifications, bot_state.json persistence, trading_bot.log logging
+- Market orders for execution (paper trading supported)
 """
 
 import ccxt
 import pandas as pd
 import numpy as np
 import ta
-from ta.trend import SMAIndicator
+from ta.trend import EMAIndicator
 from ta.momentum import RSIIndicator
+from ta.trend import MACD
+from ta.volatility import AverageTrueRange
 import time
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 import json
 import requests
+import math
+import traceback
 
-# Load environment variables
+# Load environment variables from .env
 load_dotenv()
 
 class CryptoTradingBot:
-    def __init__(self):
-        self.setup_logging()
-        self.setup_exchange()
+    def __init__(self, exchange=None, logger=None):
+        # Allow injecting logger/exchange for tests
+        if logger is not None:
+            self.logger = logger
+        else:
+            self.setup_logging()
         self.load_config()
-        self.positions = {}
-        self.trade_history = []
-        self.daily_pnl = 0.0
+        if exchange is not None:
+            self.exchange = exchange
+            if hasattr(self.exchange, 'fetch_balance'):
+                self.logger.info("Using injected exchange instance")
+        else:
+            self.setup_exchange()
+        self.positions = {}         # active positions {symbol: {...}}
+        self.trade_history = []     # list of trade dicts
         self.session_start_balance = 0.0
         self.peak_balance = 0.0
         self.emergency_stop = False
-        self.discord_webhook_url = "https://discordapp.com/api/webhooks/1403453073485070527/P50wqbjUl9OHODBe1IoRNzT7jQ_ObpRhQQE-K50AfRB0m-utkNApo2UKA_HnMnF3jy0W"
-        
+        self.load_state()
+
+    # ---------------------------
+    # Setup & Utilities
+    # ---------------------------
     def setup_logging(self):
-        """Setup logging configuration"""
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler('trading_bot.log'),
-                logging.StreamHandler()
-            ]
-        )
+        # Respect LOG_LEVEL from environment; default INFO
+        log_level_name = os.getenv('LOG_LEVEL', 'INFO').upper()
+        log_level = getattr(logging, log_level_name, logging.INFO)
+
+        # Avoid duplicate handlers if re-initialized
+        root_logger = logging.getLogger()
+        if root_logger.handlers:
+            for h in list(root_logger.handlers):
+                root_logger.removeHandler(h)
+
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler = logging.FileHandler('trading_bot.log', encoding='utf-8')
+        file_handler.setFormatter(formatter)
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+
+        root_logger.setLevel(log_level)
+        root_logger.addHandler(file_handler)
+        root_logger.addHandler(stream_handler)
+
+        # Quiet very chatty libs
+        logging.getLogger('ccxt').setLevel(logging.WARNING)
+        logging.getLogger('urllib3').setLevel(logging.WARNING)
+
         self.logger = logging.getLogger(__name__)
-        
-    def send_discord_notification(self, message, color=None):
-        """Send notification to Discord webhook"""
-        try:
-            if not self.discord_webhook_url:
-                return
-                
-            # Create embed for better formatting
-            embed = {
-                "title": "🤖 Crypto Trading Bot",
-                "description": message,
-                "timestamp": datetime.now().isoformat(),
-                "color": color or 0x00ff00  # Default green
-            }
-            
-            payload = {
-                "embeds": [embed]
-            }
-            
-            response = requests.post(self.discord_webhook_url, json=payload, timeout=10)
-            if response.status_code == 204:
-                self.logger.info("Discord notification sent successfully")
-            else:
-                self.logger.warning(f"Discord notification failed: {response.status_code}")
-                
-        except Exception as e:
-            self.logger.error(f"Error sending Discord notification: {e}")
-        
+        self.logger.info(f"Logging initialized at level {log_level_name}")
+
+    def load_config(self):
+        # Primary config - adjust as necessary
+        self.config = {
+            'symbols': ['BTC/USD', 'ETH/USD', 'ADA/USD', 'XRP/USD', 'SOL/USD'],
+            'check_interval': 30,  # seconds between position management cycles (30 seconds)
+            'entry_scan_interval': 300,  # seconds between entry signal scans (5 minutes)
+            'rate_limit_sleep': 1.1,  # seconds to sleep between exchange requests
+            'paper_trading': os.getenv('PAPER_TRADING', 'True').lower() == 'true',
+            'kraken_sandbox': os.getenv('KRAKEN_SANDBOX', 'False').lower() == 'true',
+            # Indicators / Timeframes
+            'tf_execution': '15m',
+            'tf_signal': '1h',
+            'tf_trend': '4h',
+            # Indicators parameters
+            'ema_short': 21,
+            'ema_long': 50,
+            'rsi_period': 14,
+            'macd_fast': 12,
+            'macd_slow': 26,
+            'macd_signal': 9,
+            'vol_ma_period': 20,
+            'atr_period': 14,
+            # Entry filters
+            'rsi_entry_low': 40,
+            'rsi_entry_high': 60,
+            'rsi_hard_upper': 70,
+            'rsi_hard_lower': 30,
+            'max_recent_move_pct': 5.0,  # avoid if >5% in last 2 hours
+            # Position sizing rules
+            'btc_eth_min_value': 16.0,   # minimum $16 position for BTC and ETH
+            'others_target_pct': 0.10,   # 10% target allocation for ADA, XRP, SOL
+            'max_concurrent_positions': 3,
+            'per_asset_cap_pct': 0.20,   # 20% cap per asset
+            # Risk management
+            'stop_loss_pct': 0.02,       # 2% fixed stop loss
+            'partial_tp_pct': 0.03,      # 3% partial take profit (50% of pos)
+            'primary_tp_pct': 0.05,      # default 5% primary take profit (between 4-6%)
+            'trailing_activate_pct': 0.03, # activate trailing after +3%
+            'trailing_pct': 0.015,       # 1.5% trailing
+            'time_exit_hours': 48,       # time-based exit if no movement
+            # Safety
+            'daily_loss_limit_pct': 0.05,  # 5% daily loss limit -> stop trading
+            'max_drawdown_pct': 0.05,      # 5% peak drawdown emergency stop
+            'min_trade_amount_usd': 5.0,  # global absolute minimum trade (USD)
+            # correlation settings
+            'correlation_lookback_4h_hours': 30 * 24,  # fallback if needed
+            'correlation_threshold': 0.8,
+            # logging / state
+            'state_file': 'bot_state.json',
+            'log_file': 'trading_bot.log',
+            # Discord webhook from your previous code (keeps your webhook)
+            'discord_webhook_url': os.getenv('DISCORD_WEBHOOK_URL') or
+                                   "https://discordapp.com/api/webhooks/1403453073485070527/P50wqbjUl9OHODBe1IoRNzT7jQ_ObpRhQQE-K50AfRB0m-utkNApo2UKA_HnMnF3jy0W"
+        }
+
     def setup_exchange(self):
-        """Initialize Kraken exchange connection"""
         try:
             api_key = os.getenv('KRAKEN_API_KEY')
             secret = os.getenv('KRAKEN_SECRET')
             if not api_key or not secret:
-                raise ValueError("KRAKEN_API_KEY and KRAKEN_SECRET must be set in environment variables")
+                self.logger.warning("Kraken API key/secret not found in environment; running in paper trading only.")
             self.exchange = ccxt.kraken({
                 'apiKey': api_key,
                 'secret': secret,
-                'sandbox': os.getenv('KRAKEN_SANDBOX', 'False').lower() == 'true',
                 'enableRateLimit': True,
-                'rateLimit': 1000,  # Kraken allows 1 request per second
+                'rateLimit': 1000,
+                'timeout': 30_000,
             })
-            
-            # Test connection
-            balance = self.exchange.fetch_balance()
-            self.logger.info("Successfully connected to Kraken")
-            self.logger.info(f"Account balance: {balance['total']}")
-            
+            # Kraken sandbox: ccxt uses 'urls': {'api': {...}} but it's fine if not used; we respect config
+            if self.config['kraken_sandbox']:
+                self.logger.info("Sandbox mode enabled (note: confirm sandbox urls if needed).")
+            # test fetch balance if keys exist
+            if api_key and secret:
+                try:
+                    balance = self.exchange.fetch_balance()
+                    self.logger.info("Connected to Kraken; balance keys present.")
+                except Exception as e:
+                    self.logger.warning(f"Couldn't fetch balance from Kraken: {e}")
         except Exception as e:
-            self.logger.error(f"Failed to connect to Kraken: {e}")
+            self.logger.error(f"Exchange setup error: {e}")
             raise
-            
-    def load_config(self):
-        """Load trading configuration"""
-        self.config = {
-            'symbols': ['BTC/USD', 'ETH/USD', 'ADA/USD'],  # Trading pairs
-            'timeframe': '1h',  # 1 hour candles
-            'short_ma_period': 10,  # Short moving average
-            'long_ma_period': 30,   # Long moving average
-            'rsi_period': 14,       # RSI period
-            'rsi_entry_threshold': 65,  # RSI entry filter (buy when RSI < 65) - more selective
-            'rsi_exit_threshold': 70,   # RSI exit filter (sell when RSI > 75)
-            'position_size_pct': 0.3333,  # 33.33% (one-third) of portfolio per trade
-            'stop_loss_pct': 0.04,      # 4% stop loss (within 3-5% range)
-            'take_profit_pct': 0.03,    # 3% take profit (faster profit capture)
-            'trailing_stop_pct': 0.015, # 1.5% trailing stop to protect profits
-            'volume_ma_period': 20,     # Volume moving average for confirmation
-            'volume_threshold': 0.8,    # Volume must be 0.8x above average (more realistic)
-            'momentum_periods': 2,      # Price must be above both MAs for X periods (reduced)
-            'max_hold_hours': 24,       # Maximum hold time in hours
-            'max_drawdown_pct': 0.10,   # 10% max portfolio drawdown (emergency stop)
-            'daily_loss_limit_pct': 0.05, # 5% daily loss limit
-            'correlation_threshold': 0.7,  # Don't buy correlated assets (0.7 = 70% correlation)
-            'min_trade_amount': 15,     # Minimum trade amount in USD (matches Bitcoin minimum)
-            'check_interval': 300,      # Check every 5 minutes
-            'paper_trading': os.getenv('PAPER_TRADING', 'True').lower() == 'true',  # Paper trading mode
-        }
-        
-    def get_historical_data(self, symbol, timeframe='1h', limit=100):
-        """Fetch historical OHLCV data"""
+
+    # ---------------------------
+    # Discord notifications
+    # ---------------------------
+    def send_discord_notification(self, message, color=None):
         try:
-            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            webhook = self.config.get('discord_webhook_url')
+            if not webhook:
+                return
+            embed = {
+                "title": "🤖 Crypto Trading Bot",
+                "description": message,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "color": color or 0x00ff00
+            }
+            payload = {"embeds": [embed]}
+            # Note: Kraken webhook previously used returns 204 for success
+            try:
+                resp = requests.post(webhook, json=payload, timeout=10)
+                if resp.status_code in (200, 204):
+                    self.logger.info("Discord notification sent")
+                else:
+                    self.logger.warning(f"Discord webhook responded {resp.status_code}")
+            except Exception as e:
+                self.logger.warning(f"Discord send error: {e}")
+        except Exception as e:
+            self.logger.error(f"send_discord_notification error: {e}")
+
+    # ---------------------------
+    # Persistence
+    # ---------------------------
+    def save_state(self):
+        try:
+            state = {
+                'positions': self.positions,
+                'trade_history': self.trade_history[-500:],  # keep last 500
+                'session_start_balance': self.session_start_balance,
+                'peak_balance': self.peak_balance,
+                'emergency_stop': self.emergency_stop,
+                'timestamp': datetime.now(timezone.utc).isoformat()
+            }
+            with open(self.config['state_file'], 'w') as f:
+                json.dump(state, f, indent=2, default=str)
+            self.logger.info("State saved")
+        except Exception as e:
+            self.logger.error(f"Error saving state: {e}")
+
+    def load_state(self):
+        try:
+            if os.path.exists(self.config['state_file']):
+                with open(self.config['state_file'], 'r') as f:
+                    state = json.load(f)
+                self.positions = state.get('positions', {})
+                self.trade_history = state.get('trade_history', [])
+                self.session_start_balance = float(state.get('session_start_balance', 0.0) or 0.0)
+                self.peak_balance = float(state.get('peak_balance', 0.0) or 0.0)
+                self.emergency_stop = state.get('emergency_stop', False)
+                self.logger.info("Loaded saved state")
+            else:
+                self.logger.info("No saved state found; starting fresh")
+        except Exception as e:
+            self.logger.error(f"Error loading state: {e}")
+
+    # ---------------------------
+    # Data fetch & indicators
+    # ---------------------------
+    def fetch_ohlcv(self, symbol, timeframe, limit=500):
+        """Fetch OHLCV and convert to DataFrame"""
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
             return df
         except Exception as e:
-            self.logger.error(f"Error fetching data for {symbol}: {e}")
+            self.logger.error(f"fetch_ohlcv error {symbol} {timeframe}: {e}")
             return None
-        
-    def generate_signals(self, df):
-        """Generate enhanced buy/sell signals with volume and momentum confirmation"""
-        if len(df) < 2:
-            return {'buy': False, 'sell': False, 'price': 0, 'rsi': 0, 'ma_short': 0, 'ma_long': 0}
-            
-        latest = df.iloc[-1]
-        previous = df.iloc[-2]
-        
-        # Moving average crossover signals
-        ma_cross_up = (previous['ma_short'] <= previous['ma_long']) and (latest['ma_short'] > latest['ma_long'])
-        
-        # Trend analysis for safer entries
-        ma_uptrend = latest['ma_short'] > latest['ma_long']
-        ma_gap_pct = (latest['ma_short'] - latest['ma_long']) / latest['ma_long'] * 100
-        meaningful_trend = ma_gap_pct >= 0.25  # At least 0.25% gap between MAs
-        
-        # Price extension check (don't buy if too far from MA)
-        price_ext_pct = (latest['close'] - latest['ma_short']) / latest['ma_short'] * 100
-        price_not_extended = price_ext_pct <= 3.0  # Price within 3% of short MA
-        
-        # Volume confirmation
-        volume_confirmed = latest['volume_ratio'] >= self.config['volume_threshold']
-        
-        # Momentum confirmation - price above both MAs for required periods
-        momentum_confirmed = latest['momentum_count'] >= self.config['momentum_periods']
-        
-        # Safe uptrend: meaningful trend + price not extended + good momentum
-        safe_uptrend = (ma_uptrend and meaningful_trend and price_not_extended and 
-                       momentum_confirmed and volume_confirmed)
-        
-        # Enhanced buy signal: (MA crossover OR safe uptrend) + RSI + volume + momentum
-        buy_signal = ((ma_cross_up or safe_uptrend) and 
-                     latest['rsi'] < self.config['rsi_entry_threshold'] and
-                     volume_confirmed and
-                     momentum_confirmed)
-        
-        # Sell signal: MA crossover down (short MA crosses below long MA) OR RSI > threshold OR weak trend
-        ma_cross_down = (previous['ma_short'] >= previous['ma_long']) and (latest['ma_short'] < latest['ma_long'])
-        weak_trend = (latest['ma_short'] - latest['ma_long']) / latest['ma_long'] < 0.001  # 0.1% gap - trend weakening
-        sell_signal = ma_cross_down or latest['rsi'] > self.config['rsi_exit_threshold'] or weak_trend
-        
-        return {
-            'buy': buy_signal,
-            'sell': sell_signal,
-            'price': latest['close'],
-            'rsi': latest['rsi'],
-            'ma_short': latest['ma_short'],
-            'ma_long': latest['ma_long'],
-            'ma_cross_up': ma_cross_up,
-            'ma_cross_down': ma_cross_down,
-            'safe_uptrend': safe_uptrend,
-            'ma_uptrend': ma_uptrend,
-            'price_not_extended': price_not_extended,
-            'meaningful_trend': meaningful_trend,
-            'volume_confirmed': volume_confirmed,
-            'momentum_confirmed': momentum_confirmed,
-            'volume_ratio': latest['volume_ratio'],
-            'momentum_count': latest['momentum_count'],
-            'ma_gap_pct': ma_gap_pct,
-            'price_ext_pct': price_ext_pct
-        }
-        
-    def calculate_position_size(self, symbol, price):
-        """Calculate position size based on portfolio percentage"""
+
+    def fetch_multi_tf(self, symbol, limit_1m=1200):
+        """
+        Fetch 1m and resample to 15m, 1h, 4h.
+        Use limit_1m to gather sufficient history (e.g. 1200 minutes ~ 20 hours).
+        """
         try:
-            balance = self.exchange.fetch_balance()
-            # Use 'USD' key for USD balances (ccxt normalizes this)
-            usd_key = 'USD'
-            available_balance = balance['total'].get(usd_key, 0)
-            
-            # Log available balance for debugging
-            self.logger.info(f"Available USD balance: ${available_balance:.2f}")
-                
-            position_value = available_balance * self.config['position_size_pct']
-            quantity = position_value / price
-            
-            # Check minimum trade amount
-            if position_value < self.config['min_trade_amount']:
-                self.logger.warning(f"Position value ${position_value:.2f} below minimum ${self.config['min_trade_amount']}")
-                return 0
-            
-            # Check if we have sufficient balance (with small buffer for fees)
-            if position_value > (available_balance * 0.98):  # Leave 2% buffer for fees
-                self.logger.warning(f"Insufficient balance: need ${position_value:.2f}, have ${available_balance:.2f}")
-                return 0
-                
-            self.logger.info(f"Position size: ${position_value:.2f} ({quantity:.6f} {symbol.split('/')[0]})")
-            return quantity
-            
+            self.logger.debug(f"Fetching 1m data for {symbol} limit={limit_1m}")
+            ohlcv = self.exchange.fetch_ohlcv(symbol, '1m', limit=limit_1m)
+            df1 = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df1['timestamp'] = pd.to_datetime(df1['timestamp'], unit='ms')
+            df1.set_index('timestamp', inplace=True)
+            # Resample (use non-deprecated aliases)
+            df15 = df1.resample('15min').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
+            df1h = df1.resample('1h').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
+            df4h = df1.resample('4h').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
+            self.logger.debug(f"Resampled {symbol}: 1m={len(df1)}, 15m={len(df15)}, 1h={len(df1h)}, 4h={len(df4h)}")
+            return {'1m': df1, '15m': df15, '1h': df1h, '4h': df4h}
         except Exception as e:
-            self.logger.error(f"Error calculating position size: {e}")
-            return 0
+            self.logger.error(f"fetch_multi_tf error for {symbol}: {e}")
+            return None
+
+    def compute_indicators_on_df(self, df):
+        """Compute EMA21/50, RSI14, MACD, vol MA20, ATR14 for a DataFrame"""
+        if df is None:
+            return df
+        try:
+            df = df.copy()
+            # Pre-create columns with NaN defaults
+            for col in ['ema21','ema50','rsi14','macd','macd_signal','macd_hist','vol_ma20','vol_ratio','atr14']:
+                if col not in df.columns:
+                    df[col] = np.nan
+
+            computed = []
+            # EMA21
+            if len(df) >= self.config['ema_short']:
+                df['ema21'] = EMAIndicator(df['close'], window=self.config['ema_short']).ema_indicator()
+                computed.append('ema21')
+            # EMA50
+            if len(df) >= self.config['ema_long']:
+                df['ema50'] = EMAIndicator(df['close'], window=self.config['ema_long']).ema_indicator()
+                computed.append('ema50')
+            # RSI14
+            if len(df) >= self.config['rsi_period'] + 1:
+                df['rsi14'] = RSIIndicator(df['close'], window=self.config['rsi_period']).rsi()
+                computed.append('rsi14')
+            # MACD
+            macd_min_len = max(self.config['macd_slow'], self.config['macd_signal']) + 1
+            if len(df) >= macd_min_len:
+                macd = MACD(df['close'], window_slow=self.config['macd_slow'],
+                            window_fast=self.config['macd_fast'],
+                            window_sign=self.config['macd_signal'])
+                df['macd'] = macd.macd()
+                df['macd_signal'] = macd.macd_signal()
+                df['macd_hist'] = df['macd'] - df['macd_signal']
+                computed.append('macd')
+            # Volume MA and ratio (safe with min_periods=1)
+            df['vol_ma20'] = df['volume'].rolling(window=self.config['vol_ma_period'], min_periods=1).mean()
+            df['vol_ratio'] = df['volume'] / df['vol_ma20'].replace(0, np.nan)
+            computed.append('vol')
+            # ATR14
+            if len(df) >= self.config['atr_period'] + 1:
+                atr = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=self.config['atr_period'])
+                df['atr14'] = atr.average_true_range()
+                computed.append('atr14')
+            self.logger.debug(f"Indicators computed (len={len(df)}): {computed}")
+            # Fill forward or drop NaN when needed
+            return df
+        except Exception as e:
+            self.logger.error(f"compute_indicators_on_df error: {e}")
+            return df
+
+    # ---------------------------
+    # Entry logic
+    # ---------------------------
+
+    def recent_pct_move(self, df_15m, lookback_minutes=120):
+        """
+        Compute % move over last `lookback_minutes` using 15m data
+        """
+        try:
+            if df_15m is None or len(df_15m) == 0:
+                return 0.0
+            lookback_bars = max(1, int(lookback_minutes / 15))
+            recent = df_15m['close'].iloc[-lookback_bars:]
+            pct = (recent.iloc[-1] - recent.iloc[0]) / recent.iloc[0] * 100.0
+            return abs(pct)
+        except Exception as e:
+            self.logger.debug(f"recent_pct_move error: {e}")
+            return 0.0
+
+    def check_15m_confirmation(self, df15):
+        """
+        15m confirmation candle rule: last 15m candle close > open (bullish),
+        and close > ema21(15m) (momentum). Returns True/False.
+        """
+        try:
+            if df15 is None or len(df15) < 2:
+                return False
+            # ensure ema21 exists before reading last row; be robust with short history
+            if 'ema21' not in df15.columns:
+                if len(df15) >= self.config['ema_short']:
+                    df15['ema21'] = EMAIndicator(df15['close'], window=self.config['ema_short']).ema_indicator()
+                else:
+                    # Fallback with EWM to avoid ta window restrictions
+                    df15['ema21'] = df15['close'].ewm(span=self.config['ema_short'], adjust=False, min_periods=1).mean()
+            last = df15.iloc[-1]
+            last_ema21 = df15['ema21'].iloc[-1]
+            bullish = last['close'] > last['open']
+            close_above_ema = last['close'] > last_ema21
+            self.logger.debug(f"15m confirm check: open={last['open']:.4f} close={last['close']:.4f} ema21={last_ema21:.4f} -> bullish={bullish}, above_ema={close_above_ema}")
+            return bullish and close_above_ema
+        except Exception as e:
+            self.logger.debug(f"check_15m_confirmation error: {e}")
+            return False
+
+    def log_condition_check(self, symbol, conditions):
+        """Log detailed condition check results in a readable format"""
+        self.logger.info(f"🔍 ENTRY CONDITIONS CHECK for {symbol}:")
+        self.logger.info(f"   📊 Price: ${conditions.get('price', 0):.4f}")
+        
+        # EMA Cross Check
+        ema_prev = conditions.get('ema_spread_prev', 0)
+        ema_now = conditions.get('ema_spread_now', 0) 
+        cross_status = "✅ PASS" if conditions.get('ma_cross_up') else "❌ FAIL"
+        self.logger.info(f"   📈 1H EMA Cross (21>50): {cross_status} | Prev: {ema_prev:.5f} → Now: {ema_now:.5f}")
+        
+        # 4H Trend Check
+        trend_status = "✅ PASS" if conditions.get('trend_confirm') else "❌ FAIL"
+        trend_spread = conditions.get('trend_spread', 0)
+        self.logger.info(f"   📊 4H Trend Confirm: {trend_status} | EMA21-EMA50: {trend_spread:.5f}")
+        
+        # RSI Check
+        rsi = conditions.get('rsi', 0)
+        rsi_low = self.config['rsi_entry_low']
+        rsi_high = self.config['rsi_entry_high']
+        rsi_ok = rsi_low <= rsi <= rsi_high
+        rsi_status = "✅ PASS" if rsi_ok else "❌ FAIL"
+        self.logger.info(f"   📈 RSI 40-60 Range: {rsi_status} | Current: {rsi:.1f} (Range: {rsi_low}-{rsi_high})")
+        
+        # MACD Check
+        macd_status = "✅ PASS" if conditions.get('macd_ok') else "❌ FAIL"
+        macd_hist = conditions.get('macd_hist', 0)
+        macd_delta = conditions.get('macd_delta', 0)
+        self.logger.info(f"   📊 MACD Bullish: {macd_status} | Hist: {macd_hist:.5f} | Delta: {macd_delta:.5f}")
+        
+        # Volume Check
+        vol_status = "✅ PASS" if conditions.get('vol_ratio', 0) > 1.0 else "❌ FAIL"
+        vol_ratio = conditions.get('vol_ratio', 0)
+        self.logger.info(f"   📊 Volume Above MA20: {vol_status} | Ratio: {vol_ratio:.2f}x")
+        
+        # Recent Move Check
+        recent_move = conditions.get('recent_move_pct', 0)
+        move_ok = recent_move <= self.config['max_recent_move_pct']
+        move_status = "✅ PASS" if move_ok else "❌ FAIL"
+        self.logger.info(f"   📈 2H Move <5%: {move_status} | Move: {recent_move:.2f}% (Limit: {self.config['max_recent_move_pct']:.1f}%)")
+        
+        # 15m Confirmation
+        confirm_status = "✅ PASS" if conditions.get('15m_confirm') else "❌ FAIL"
+        self.logger.info(f"   ⏰ 15m Bullish Confirm: {confirm_status}")
+        
+        # Time Block Check
+        time_blocked = conditions.get('time_blocked', False)
+        time_status = "✅ PASS" if not time_blocked else "❌ FAIL"
+        self.logger.info(f"   ⏰ Time Window OK: {time_status}")
+        
+        # Overall Result
+        buy_signal = conditions.get('buy', False)
+        overall_status = "🟢 BUY SIGNAL" if buy_signal else "🔴 NO SIGNAL"
+        reason = conditions.get('reason', 'unknown')
+        self.logger.info(f"   🎯 FINAL RESULT: {overall_status} | Reason: {reason}")
+        self.logger.info(f"   {'='*60}")
+
+    def check_entry_conditions(self, symbol, dfs):
+        """
+        Returns dict with signals and reason. Follows:
+         - 1H EMA21 crosses above EMA50 (on last closed 1H candle)
+         - 4H EMA21 > EMA50
+         - 1H RSI between 40-60, and not >70 or <30
+         - 1H MACD hist positive and macd > signal
+         - 1H volume > vol_ma20
+         - 2-hour move <= 5%
+         - 15m confirmation bullish candle
+         - Not during first/last 30 minutes of day (configurable)
+        """
+        try:
+            df1h = dfs.get('1h')
+            df4h = dfs.get('4h')
+            df15 = dfs.get('15m')
+            if df1h is None or df4h is None or df15 is None:
+                return {'buy': False, 'reason': 'missing_data'}
+
+            # ensure indicators present
+            df1h = self.compute_indicators_on_df(df1h)
+            df4h = self.compute_indicators_on_df(df4h)
+            df15 = self.compute_indicators_on_df(df15)
+
+            # Need at least two 1H candles to detect cross
+            if len(df1h) < 2:
+                return {'buy': False, 'reason': 'insufficient_1h'}
+
+            prev = df1h.iloc[-2]
+            last = df1h.iloc[-1]
+            # EMA cross
+            # Guard against missing columns or NaNs in EMA columns
+            for col in ['ema21','ema50']:
+                if col not in df1h.columns:
+                    return {'buy': False, 'reason': 'insufficient_indicators'}
+            if pd.isna(prev['ema21']) or pd.isna(prev['ema50']) or pd.isna(last['ema21']) or pd.isna(last['ema50']):
+                return {'buy': False, 'reason': 'insufficient_indicators'}
+            ema_spread_prev = float(prev['ema21'] - prev['ema50'])
+            ema_spread_now = float(last['ema21'] - last['ema50'])
+            ma_cross_up = (ema_spread_prev <= 0) and (ema_spread_now > 0)
+            # 4H confirmation
+            last4h = df4h.iloc[-1]
+            for col in ['ema21','ema50']:
+                if col not in df4h.columns:
+                    return {'buy': False, 'reason': 'insufficient_trend_indicators'}
+            if pd.isna(last4h['ema21']) or pd.isna(last4h['ema50']):
+                return {'buy': False, 'reason': 'insufficient_trend_indicators'}
+            trend_spread = float(last4h['ema21'] - last4h['ema50'])
+            trend_confirm = trend_spread > 0
+            # RSI checks
+            rsi = last.get('rsi14', None)
+            if rsi is None or math.isnan(rsi):
+                return {'buy': False, 'reason': 'no_rsi'}
+            if rsi > self.config['rsi_hard_upper'] or rsi < self.config['rsi_hard_lower']:
+                return {'buy': False, 'reason': f'rsi_out_of_bounds ({rsi:.1f})'}
+            if not (self.config['rsi_entry_low'] <= rsi <= self.config['rsi_entry_high']):
+                # allow slightly outside but still not in hard bounds — we'll still reject per spec
+                return {'buy': False, 'reason': f'rsi_not_in_40_60 ({rsi:.1f})'}
+
+            # MACD check
+            macd = float(last.get('macd', 0.0) or 0.0)
+            macd_sig = float(last.get('macd_signal', 0.0) or 0.0)
+            macd_hist = float(last.get('macd_hist', macd - macd_sig) or 0.0)
+            macd_delta = float(macd - macd_sig)
+            macd_ok = (macd_delta > 0) and (macd_hist > 0)
+
+            # Volume confirmation
+            vol_ratio = float(last.get('vol_ratio', 0.0) or 0.0)
+            vol_ok = vol_ratio > 1.0  # require current volume > vol_ma20 (strict)
+
+            # 2-hour move check (use 15m series)
+            recent_move = self.recent_pct_move(df15, lookback_minutes=120)
+            move_ok = recent_move <= self.config['max_recent_move_pct']
+
+            # 15m confirmation
+            confirm15 = self.check_15m_confirmation(df15)
+
+            # time-of-day block: avoid first/last 30 minutes of UTC day
+            now = datetime.now(timezone.utc)
+            minute_of_day = now.hour * 60 + now.minute
+            first_30_block = minute_of_day < 30
+            last_30_block = minute_of_day >= (24*60 - 30)
+            time_blocked = first_30_block or last_30_block
+            if time_blocked:
+                return {'buy': False, 'reason': 'time_blocked'}
+
+            # Aggregate decision
+            buy = ma_cross_up and trend_confirm and macd_ok and vol_ok and move_ok and confirm15
+
+            reason_parts = []
+            if not ma_cross_up:
+                reason_parts.append('no_ma_cross')
+            if not trend_confirm:
+                reason_parts.append('4h_no_trend_confirm')
+            if not macd_ok:
+                reason_parts.append('macd_no')
+            if not vol_ok:
+                reason_parts.append('volume_no')
+            if not move_ok:
+                reason_parts.append(f'recent_move_high({recent_move:.2f}%)')
+            if not confirm15:
+                reason_parts.append('no_15m_confirm')
+            if not (self.config['rsi_entry_low'] <= rsi <= self.config['rsi_entry_high']):
+                reason_parts.append('rsi_not_40_60')
+
+            conditions_result = {
+                'buy': bool(buy),
+                'reason': ' & '.join(reason_parts) if reason_parts else 'all_ok',
+                'rsi': float(rsi),
+                'rsi_dist_low': float(rsi - self.config['rsi_entry_low']),
+                'rsi_dist_high': float(self.config['rsi_entry_high'] - rsi),
+                'ma_cross_up': bool(ma_cross_up),
+                'ema_spread_prev': float(ema_spread_prev),
+                'ema_spread_now': float(ema_spread_now),
+                'trend_confirm': bool(trend_confirm),
+                'trend_spread': float(trend_spread),
+                'macd_ok': bool(macd_ok),
+                'macd_hist': float(macd_hist),
+                'macd_delta': float(macd_delta),
+                'vol_ratio': float(vol_ratio),
+                'recent_move_pct': float(recent_move),
+                '15m_confirm': bool(confirm15),
+                'time_blocked': bool(time_blocked),
+                'price': float(df15['close'].iloc[-1]),
+                'atr_1h': float(df1h['atr14'].iloc[-1]) if 'atr14' in df1h.columns else None
+            }
             
-    def place_order(self, symbol, side, amount, price=None):
-        """Place market or limit order"""
+            # Log detailed condition check
+            self.log_condition_check(symbol, conditions_result)
+            
+            return conditions_result
+
+        except Exception as e:
+            self.logger.error(f"check_entry_conditions error for {symbol}: {e}\n{traceback.format_exc()}")
+            return {'buy': False, 'reason': 'exception'}
+
+    # ---------------------------
+    # Position sizing & execution
+    # ---------------------------
+    def get_portfolio_usd(self):
+        """Get estimated portfolio USD total (uses 'total' balances)."""
+        try:
+            bal = self.exchange.fetch_balance()
+            usd = 0.0
+            # Try common USD keys
+            usd_keys = ['USD', 'ZUSD', 'USDT']  # Kraken uses ZUSD sometimes; but prefer USD
+            for k in usd_keys:
+                if k in bal.get('total', {}) and bal['total'][k] is not None:
+                    usd = float(bal['total'][k])
+                    self.logger.debug(f"Portfolio USD detected via key {k}: ${usd:.2f}")
+                    break
+            # Fall back to summing known fiat + crypto via last prices (costly). For now return usd.
+            return float(usd)
+        except Exception as e:
+            self.logger.warning(f"get_portfolio_usd fallback error: {e}")
+            return 0.0
+
+    def calculate_position_amount(self, symbol, price):
+        """
+        Determine trade amount (in units) to place:
+        - For BTC & ETH: minimum position value $16
+        - For ADA/XRP/SOL: target 10% of portfolio
+        - Respect per-asset cap of 20% of portfolio
+        - Respect min_trade_amount_usd config
+        Returns amount in base currency units (e.g., BTC)
+        """
+        try:
+            portfolio_usd = self.get_portfolio_usd()
+            if portfolio_usd <= 0:
+                # Paper trading: assume small wallet fallback
+                portfolio_usd = 95.0  # as you stated
+            symbol_base = symbol.split('/')[0].upper()
+
+            # Determine target notional (USD)
+            if symbol_base in ['BTC', 'ETH', 'XBT']:
+                target_notional = max(self.config['btc_eth_min_value'], portfolio_usd * 0.05)  # ensure reasonable fraction too
+                # But don't exceed per-asset cap
+                cap_notional = portfolio_usd * self.config['per_asset_cap_pct']
+                target_notional = min(target_notional, cap_notional)
+            else:
+                target_notional = portfolio_usd * self.config['others_target_pct']
+                cap_notional = portfolio_usd * self.config['per_asset_cap_pct']
+                target_notional = min(target_notional, cap_notional)
+
+            # Enforce global minimum
+            if target_notional < self.config['min_trade_amount_usd']:
+                target_notional = self.config['min_trade_amount_usd']
+
+            qty = target_notional / price
+            # rounding depending on coin
+            if symbol_base == 'BTC' or symbol_base == 'XBT':
+                qty = round(qty, 8)
+            elif symbol_base == 'ETH':
+                qty = round(qty, 6)
+            else:
+                qty = round(qty, 6)
+            if qty <= 0:
+                return 0.0
+            return float(qty)
+        except Exception as e:
+            self.logger.error(f"calculate_position_amount error: {e}")
+            return 0.0
+
+    def execute_entry(self, symbol, amount, price):
+        """Place market buy order (or simulate in paper trading). Returns order dict or None"""
         try:
             if amount <= 0:
-                self.logger.warning(f"Invalid amount for {symbol}: {amount}")
+                self.logger.warning(f"Zero amount; skipping buy for {symbol}")
                 return None
-            
-            # Round amount to appropriate precision for the trading pair
-            # Most crypto pairs need 6-8 decimal places
-            if symbol.startswith('BTC'):
-                amount = round(amount, 8)  # BTC uses 8 decimals
-            elif symbol.startswith('ETH'):
-                amount = round(amount, 6)  # ETH uses 6 decimals
-            else:
-                amount = round(amount, 6)  # Default to 6 decimals for other coins
-            
-            # Double-check amount is still valid after rounding
-            if amount <= 0:
-                self.logger.warning(f"Amount too small after rounding for {symbol}: {amount}")
-                return None
-            
-            # Paper trading mode - simulate orders without real trades
+            # In paper trading mode, simulate
             if self.config['paper_trading']:
-                self.logger.info(f"[PAPER TRADING] {side.upper()} {amount:.6f} {symbol} at ${price:.2f}")
-                
-                # Send Discord notification for paper trades
-                self.send_discord_notification(
-                    f"📝 **PAPER TRADE**\n"
-                    f"**{side.upper()}** {amount:.6f} {symbol}\n"
-                    f"Price: ${price:.2f}\n"
-                    f"Value: ${amount * price:.2f}",
-                    color=0xffaa00  # Orange for paper trades
-                )
-                
-                # Create fake order for logging
                 order = {
-                    'id': f"paper_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                    'id': f"paper_{symbol}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
                     'symbol': symbol,
-                    'side': side,
-                    'amount': amount,
+                    'side': 'buy',
+                    'filled': amount,
                     'price': price,
                     'status': 'closed',
-                    'paper_trade': True
+                    'timestamp': datetime.now(timezone.utc).isoformat()
                 }
+                # notify
+                self.send_discord_notification(f"📝 [PAPER] BUY {symbol} amount={amount} @ {price:.2f}", color=0xffaa00)
+                self.trade_history.append({'timestamp': datetime.now(timezone.utc).isoformat(), 'symbol': symbol, 'side': 'buy', 'amount': amount, 'price': price, 'order': order})
+                return order
             else:
-                # Real trading - place actual market order
-                order = self.exchange.create_market_order(symbol, side, amount)
-                self.logger.info(f"[LIVE TRADING] Order placed: {side} {amount:.6f} {symbol} - Order ID: {order['id']}")
-                
-                # Send Discord notification for live trades
-                trade_value = amount * price
-                self.send_discord_notification(
-                    f"💰 **LIVE TRADE EXECUTED**\n"
-                    f"**{side.upper()}** {amount:.6f} {symbol}\n"
-                    f"Price: ${price:.2f}\n"
-                    f"Value: ${trade_value:.2f}\n"
-                    f"Order ID: {order['id']}",
-                    color=0x00ff00 if side == 'buy' else 0xff0000  # Green for buy, red for sell
-                )
-                
-            # Log trade
-            trade_record = {
-                'timestamp': datetime.now().isoformat(),
-                'symbol': symbol,
-                'side': side,
-                'amount': amount,
-                'price': price,
-                'order_id': order['id'],
-                'paper_trade': self.config['paper_trading']
-            }
-            self.trade_history.append(trade_record)
-            
-            return order
-            
+                # Place market order on Kraken
+                self.logger.info(f"Placing MARKET BUY {symbol} amount={amount}")
+                # Use create_market_order where ccxt exchange supports (some need create_order with 'market')
+                order = self.exchange.create_market_buy_order(symbol, amount)
+                self.logger.info(f"Placed market buy order: {order.get('id', order)}")
+                self.send_discord_notification(f"💰 [LIVE] BUY {symbol} amount={amount} @ market", color=0x00ff00)
+                self.trade_history.append({'timestamp': datetime.now(timezone.utc).isoformat(), 'symbol': symbol, 'side': 'buy', 'amount': amount, 'price': price, 'order': order})
+                return order
         except Exception as e:
-            self.logger.error(f"Error placing {side} order for {symbol}: {e}")
+            self.logger.error(f"execute_entry error for {symbol}: {e}\n{traceback.format_exc()}")
             return None
-            
-    def check_stop_loss_take_profit(self, symbol, position):
-        """Check stop loss, take profit, trailing stop, and time-based exit conditions"""
+
+    # ---------------------------
+    # Position management & exits
+    # ---------------------------
+    def close_position(self, symbol, amount=None, reason='manual'):
+        """Close a position fully (or partially if amount provided)"""
         try:
-            current_price = self.exchange.fetch_ticker(symbol)['last']
-            entry_price = position['entry_price']
-            side = position['side']
-            
-            # Check time-based exit (24-hour max hold)
-            position_time = datetime.fromisoformat(position['timestamp'])
-            hours_held = (datetime.now() - position_time).total_seconds() / 3600
-            
-            if hours_held >= self.config['max_hold_hours']:
-                pnl_pct = (current_price - entry_price) / entry_price
-                self.logger.info(f"Time-based exit for {symbol}: held {hours_held:.1f}h, P&L: {pnl_pct:.2%}")
-                
-                # Send Discord notification for time exit
-                self.send_discord_notification(
-                    f"⏰ **TIME-BASED EXIT**\n"
-                    f"Symbol: {symbol}\n"
-                    f"Entry Price: ${entry_price:.2f}\n"
-                    f"Current Price: ${current_price:.2f}\n"
-                    f"Time Held: {hours_held:.1f} hours\n"
-                    f"Final P&L: {pnl_pct:.2%}",
-                    color=0x800080  # Purple for time exit
-                )
-                return 'sell'
-            
-            if side == 'buy':
-                # Calculate P&L percentage
-                pnl_pct = (current_price - entry_price) / entry_price
-                
-                # Update highest price seen for trailing stop
-                highest_price = position.get('highest_price', entry_price)
-                if current_price > highest_price:
-                    highest_price = current_price
-                    position['highest_price'] = highest_price
-                    self.logger.info(f"{symbol} - New high: ${highest_price:.2f}, P&L: {pnl_pct:.2%}")
-                
-                # Calculate trailing stop price
-                trailing_stop_price = highest_price * (1 - self.config['trailing_stop_pct'])
-                
-                # Check stop loss (hard stop)
-                if pnl_pct <= -self.config['stop_loss_pct']:
-                    self.logger.info(f"Stop loss triggered for {symbol}: {pnl_pct:.3f}%")
-                    
-                    # Send Discord notification for stop loss
-                    self.send_discord_notification(
-                        f"🛑 **STOP LOSS TRIGGERED**\n"
-                        f"Symbol: {symbol}\n"
-                        f"Entry Price: ${entry_price:.2f}\n"
-                        f"Current Price: ${current_price:.2f}\n"
-                        f"Loss: {pnl_pct:.2%}",
-                        color=0xff0000  # Red for stop loss
-                    )
-                    return 'sell'
-                
-                # Check trailing stop (protect profits)
-                if current_price <= trailing_stop_price and highest_price > entry_price:
-                    trailing_pnl = (current_price - entry_price) / entry_price
-                    self.logger.info(f"Trailing stop triggered for {symbol}: {trailing_pnl:.3f}%")
-                    
-                    # Send Discord notification for trailing stop
-                    self.send_discord_notification(
-                        f"📉 **TRAILING STOP TRIGGERED**\n"
-                        f"Symbol: {symbol}\n"
-                        f"Entry Price: ${entry_price:.2f}\n"
-                        f"High Price: ${highest_price:.2f}\n"
-                        f"Current Price: ${current_price:.2f}\n"
-                        f"Final P&L: {trailing_pnl:.2%}",
-                        color=0xffa500  # Orange for trailing stop
-                    )
-                    return 'sell'
-                    
-                # Check take profit (quick profit capture)
-                if pnl_pct >= self.config['take_profit_pct']:
-                    self.logger.info(f"Take profit triggered for {symbol}: {pnl_pct:.3f}%")
-                    
-                    # Send Discord notification for take profit
-                    self.send_discord_notification(
-                        f"🎯 **TAKE PROFIT TRIGGERED**\n"
-                        f"Symbol: {symbol}\n"
-                        f"Entry Price: ${entry_price:.2f}\n"
-                        f"Current Price: ${current_price:.2f}\n"
-                        f"Profit: {pnl_pct:.2%}",
-                        color=0x00ff00  # Green for take profit
-                    )
-                    return 'sell'
-                    
+            if symbol not in self.positions:
+                self.logger.warning(f"Tried to close {symbol} but no active position")
+                return None
+            pos = self.positions[symbol]
+            amount_to_sell = amount if amount is not None else pos['amount']
+            last_price_raw = self.exchange.fetch_ticker(symbol)['last'] if not self.config['paper_trading'] else pos['entry_price'] * (1 + 0.01)
+            if last_price_raw is None:
+                self.logger.warning(f"No last price available for {symbol}, skipping close")
+                return None
+            current_price = float(last_price_raw)
+            if self.config['paper_trading']:
+                # simulate sell
+                order = {'id': f"paper_sell_{symbol}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}", 'status': 'closed', 'filled': amount_to_sell, 'price': current_price}
+                self.send_discord_notification(f"📝 [PAPER] SELL {symbol} amount={amount_to_sell} @ {current_price:.2f} (reason: {reason})", color=0xff6600)
+            else:
+                order = self.exchange.create_market_sell_order(symbol, amount_to_sell)
+                self.send_discord_notification(f"💸 [LIVE] SELL {symbol} amount={amount_to_sell} (reason: {reason})", color=0xff0000)
+
+            # compute P&L in approximate terms
+            entry = pos['entry_price']
+            pnl_pct = (current_price - entry) / entry
+            self.logger.info(f"Closed {symbol} amount={amount_to_sell} entry={entry:.4f} exit={current_price:.4f} P&L={pnl_pct:.2%} (reason: {reason})")
+            # log
+            self.trade_history.append({'timestamp': datetime.now(timezone.utc).isoformat(), 'symbol': symbol, 'side': 'sell', 'amount': amount_to_sell, 'price': current_price, 'order': order, 'reason': reason})
+            # reduce or remove position
+            if amount is None or math.isclose(amount_to_sell, pos['amount'], rel_tol=1e-6):
+                del self.positions[symbol]
+            else:
+                pos['amount'] = round(pos['amount'] - amount_to_sell, 8)
+                self.positions[symbol] = pos
+            self.save_state()
+            return order
         except Exception as e:
-            self.logger.error(f"Error checking stop loss/take profit for {symbol}: {e}")
-            
-        return None
-        
-    def check_risk_management(self):
-        """Check risk management rules and emergency stops"""
+            self.logger.error(f"close_position error for {symbol}: {e}\n{traceback.format_exc()}")
+            return None
+
+    def manage_positions_cycle(self):
+        """Run checks for each open position to enforce SL, TP, trailing, and time-based exits"""
         try:
-            # Get current balance
-            balance = self.exchange.fetch_balance()
-            current_balance = balance['total'].get('USD', 0)
-            
-            # Initialize session tracking on first run
-            if self.session_start_balance == 0:
-                self.session_start_balance = current_balance
-                self.peak_balance = current_balance
-                self.logger.info(f"Session started with balance: ${current_balance:.2f}")
+            to_close = []
+            for symbol, pos in list(self.positions.items()):
+                try:
+                    # fetch last price
+                    if not self.config['paper_trading']:
+                        ticker = self.exchange.fetch_ticker(symbol)
+                        last_price_raw = ticker.get('last')
+                        if last_price_raw is None:
+                            self.logger.warning(f"No last price available for {symbol}, skipping position management")
+                            continue
+                        last_price = float(last_price_raw)
+                    else:
+                        last_price = pos['entry_price'] * 1.01
+                    entry_price = pos['entry_price']
+                    pnl_pct = (last_price - entry_price) / entry_price
+                    
+                    # Calculate exit condition thresholds
+                    sl_trigger = -self.config['stop_loss_pct']
+                    partial_tp_trigger = self.config['partial_tp_pct']
+                    primary_tp_trigger = self.config['primary_tp_pct']
+                    trail_activate_trigger = self.config['trailing_activate_pct']
+                    
+                    trail_active = pos.get('trailing_active', False)
+                    trail_highest = pos.get('highest_price', last_price)
+                    trail_price = trail_highest * (1 - self.config['trailing_pct']) if trail_active else None
+                    age_hours = (datetime.now(timezone.utc) - datetime.fromisoformat(pos['timestamp']).replace(tzinfo=timezone.utc)).total_seconds() / 3600
+                    partial_taken = pos.get('partial_taken', False)
+                    
+                    # Enhanced position management logging
+                    self.logger.info(f"🔍 POSITION CHECK for {symbol}:")
+                    self.logger.info(f"   💰 Current: ${last_price:.4f} | Entry: ${entry_price:.4f} | P&L: {pnl_pct:.2%}")
+                    self.logger.info(f"   ⏰ Age: {age_hours:.1f}h | Partial Taken: {'Yes' if partial_taken else 'No'}")
+                    
+                    # Stop Loss Check
+                    sl_hit = pnl_pct <= sl_trigger
+                    sl_status = "🚨 TRIGGERED" if sl_hit else "✅ OK"
+                    self.logger.info(f"   🛑 Stop Loss ({sl_trigger:.1%}): {sl_status} | Current P&L: {pnl_pct:.2%}")
+                    
+                    # Partial TP Check
+                    partial_ready = not partial_taken and pnl_pct >= partial_tp_trigger
+                    partial_status = "💰 READY" if partial_ready else ("✅ TAKEN" if partial_taken else "⏳ WAITING")
+                    self.logger.info(f"   🎯 Partial TP ({partial_tp_trigger:.1%}): {partial_status}")
+                    
+                    # Primary TP Check
+                    primary_tp_hit = pnl_pct >= primary_tp_trigger
+                    primary_status = "💰 TRIGGERED" if primary_tp_hit else "⏳ WAITING"
+                    self.logger.info(f"   🎯 Primary TP ({primary_tp_trigger:.1%}): {primary_status}")
+                    
+                    # Trailing Stop Check
+                    trail_will_activate = not trail_active and pnl_pct >= trail_activate_trigger
+                    if trail_active:
+                        trail_hit = trail_price is not None and last_price <= trail_price and trail_highest > entry_price
+                        trail_status = "🚨 HIT" if trail_hit else f"✅ ACTIVE (Trail: ${trail_price:.4f})" if trail_price else "❌ ERROR"
+                    elif trail_will_activate:
+                        trail_status = "🟡 ACTIVATING"
+                    else:
+                        trail_status = "⏳ INACTIVE"
+                    self.logger.info(f"   🔄 Trailing Stop: {trail_status} | Highest: ${trail_highest:.4f}")
+                    
+                    # Time Exit Check
+                    time_exit_due = age_hours >= self.config['time_exit_hours']
+                    time_status = "⏰ DUE" if time_exit_due else "✅ OK"
+                    self.logger.info(f"   ⏰ Time Exit ({self.config['time_exit_hours']}h): {time_status}")
+                    
+                    # update highest price for trailing
+                    if 'highest_price' not in pos or last_price > pos.get('highest_price', entry_price):
+                        pos['highest_price'] = last_price
+                    
+                    # Execute exit conditions in priority order
+                    # Stop loss
+                    if sl_hit:
+                        self.logger.info(f"🚨 EXECUTING: Stop loss for {symbol}")
+                        self.close_position(symbol, reason='stop_loss')
+                        continue
+                    
+                    # Partial TP at 3%: if still hasn't taken partial, take 50% and set trailing
+                    if partial_ready:
+                        half = round(pos['amount'] * 0.5, 8)
+                        if half > 0:
+                            self.logger.info(f"💰 EXECUTING: Partial TP for {symbol} (50% at {pnl_pct:.2%})")
+                            self.close_position(symbol, amount=half, reason='partial_take_profit')
+                            pos['partial_taken'] = True
+                            # keep trailing active (set minimal)
+                            pos['trailing_active'] = True
+                            pos['trail_start_price'] = pos.get('highest_price', last_price)
+                            self.positions[symbol] = pos
+                            continue
+                    
+                    # Activate trailing when profit >= trailing_activate_pct
+                    if trail_will_activate:
+                        self.logger.info(f"🔄 ACTIVATING: Trailing stop for {symbol}")
+                        pos['trailing_active'] = True
+                        pos['trail_start_price'] = pos.get('highest_price', last_price)
+                    
+                    # Trailing stop enforcement
+                    if trail_active:
+                        highest = pos.get('highest_price', last_price)
+                        trail_price = highest * (1 - self.config['trailing_pct'])
+                        if last_price <= trail_price and highest > entry_price:
+                            self.logger.info(f"🔄 EXECUTING: Trailing stop for {symbol} (${last_price:.4f} <= ${trail_price:.4f})")
+                            self.close_position(symbol, reason='trailing_stop')
+                            continue
+                    
+                    # Primary TP
+                    if primary_tp_hit:
+                        self.logger.info(f"🎯 EXECUTING: Primary TP for {symbol} at {pnl_pct:.2%}")
+                        self.close_position(symbol, reason='primary_take_profit')
+                        continue
+                    
+                    # Time-based exit
+                    if time_exit_due:
+                        self.logger.info(f"⏰ EXECUTING: Time exit for {symbol} after {age_hours:.1f}h")
+                        self.close_position(symbol, reason='time_exit')
+                        continue
+                    
+                    # update pos record
+                    self.positions[symbol] = pos
+                    self.logger.info(f"   ✅ Position {symbol} maintained")
+                    self.logger.info(f"   {'='*50}")
+                    
+                except Exception as inner_e:
+                    self.logger.error(f"Error managing position {symbol}: {inner_e}\n{traceback.format_exc()}")
+            # Save if any closed
+            self.save_state()
+        except Exception as e:
+            self.logger.error(f"manage_positions_cycle top error: {e}\n{traceback.format_exc()}")
+
+    # ---------------------------
+    # Correlation check (simple)
+    # ---------------------------
+    def check_correlation(self, candidate_symbol):
+        """
+        Compute correlation (Pearson) between candidate_symbol and existing position symbols on 4H returns.
+        If correlation > threshold, refuse to open candidate if conflict arises.
+        """
+        try:
+            active_symbols = list(self.positions.keys())
+            if not active_symbols:
                 return True
-            
-            # Update peak balance
-            if current_balance > self.peak_balance:
-                self.peak_balance = current_balance
-            
-            # Calculate drawdown from peak
-            drawdown_pct = (self.peak_balance - current_balance) / self.peak_balance
-            
-            # Calculate daily P&L
-            daily_pnl_pct = (current_balance - self.session_start_balance) / self.session_start_balance
-            
-            # Log risk metrics
-            self.logger.info(f"Risk Check - Balance: ${current_balance:.2f}, Peak: ${self.peak_balance:.2f}, "
-                           f"Drawdown: {drawdown_pct:.2%}, Daily P&L: {daily_pnl_pct:.2%}")
-            
-            # Check maximum drawdown (emergency stop)
+            # fetch 4h returns for candidate and each active pos
+            candidate_df = self.fetch_ohlcv(candidate_symbol, '4h', limit=200)
+            if candidate_df is None or len(candidate_df) < 10:
+                return True
+            candidate_returns = candidate_df['close'].pct_change().dropna()
+            for sym in active_symbols:
+                df = self.fetch_ohlcv(sym, '4h', limit=200)
+                if df is None or len(df) < 10:
+                    continue
+                returns = df['close'].pct_change().dropna()
+                # align lengths
+                minlen = min(len(candidate_returns), len(returns))
+                if minlen < 5:
+                    continue
+                corr = candidate_returns.iloc[-minlen:].corr(returns.iloc[-minlen:])
+                if corr is not None and abs(corr) >= self.config['correlation_threshold']:
+                    self.logger.warning(f"Correlation {corr:.2f} between {candidate_symbol} and {sym} exceeds threshold")
+                    return False
+            return True
+        except Exception as e:
+            self.logger.error(f"check_correlation error: {e}")
+            return True
+
+    # ---------------------------
+    # Risk checks
+    # ---------------------------
+    def check_risk_management(self):
+        """
+        - Update session start / peak balances
+        - Check daily loss and drawdown emergency stop
+        """
+        try:
+            bal = None
+            try:
+                bal = self.exchange.fetch_balance()
+            except Exception as e:
+                self.logger.warning(f"Could not fetch balance: {e}")
+                # in paper mode simulate
+            current_usd = 0.0
+            if bal:
+                # try typical keys
+                for key in ['USD', 'ZUSD', 'USDT']:
+                    if key in bal.get('total', {}) and bal['total'][key] is not None:
+                        current_usd = float(bal['total'][key])
+                        break
+            else:
+                current_usd = self.session_start_balance if self.session_start_balance > 0 else 95.0
+
+            if self.session_start_balance == 0.0:
+                self.session_start_balance = current_usd
+                self.peak_balance = current_usd
+                self.logger.info(f"Session start balance set to ${self.session_start_balance:.2f}")
+
+            if current_usd > self.peak_balance:
+                self.peak_balance = current_usd
+
+            drawdown_pct = (self.peak_balance - current_usd) / self.peak_balance if self.peak_balance > 0 else 0.0
+            daily_pct = (current_usd - self.session_start_balance) / max(self.session_start_balance, 1.0)
+
+            self.logger.info(f"Risk: balance=${current_usd:.2f}, peak=${self.peak_balance:.2f}, drawdown={drawdown_pct:.2%}, daily={daily_pct:.2%}")
+
             if drawdown_pct >= self.config['max_drawdown_pct']:
                 self.emergency_stop = True
-                self.logger.error(f"EMERGENCY STOP: Maximum drawdown reached ({drawdown_pct:.2%})")
-                
-                # Send urgent Discord notification
-                self.send_discord_notification(
-                    f"🚨 **EMERGENCY STOP ACTIVATED** 🚨\n"
-                    f"Maximum drawdown exceeded: {drawdown_pct:.2%}\n"
-                    f"Peak Balance: ${self.peak_balance:.2f}\n"
-                    f"Current Balance: ${current_balance:.2f}\n"
-                    f"**BOT TRADING DISABLED**",
-                    color=0xff0000  # Red for emergency
-                )
+                self.send_discord_notification(f"🚨 EMERGENCY STOP: Peak drawdown {drawdown_pct:.2%} exceeded {self.config['max_drawdown_pct']:.2%}", color=0xff0000)
                 return False
-            
-            # Check daily loss limit
-            if daily_pnl_pct <= -self.config['daily_loss_limit_pct']:
-                self.logger.warning(f"Daily loss limit reached ({daily_pnl_pct:.2%})")
-                
-                # Send Discord notification
-                self.send_discord_notification(
-                    f"⚠️ **DAILY LOSS LIMIT REACHED** ⚠️\n"
-                    f"Daily Loss: {daily_pnl_pct:.2%}\n"
-                    f"Session Start: ${self.session_start_balance:.2f}\n"
-                    f"Current Balance: ${current_balance:.2f}\n"
-                    f"No new trades until tomorrow",
-                    color=0xff6600  # Orange for warning
-                )
+            if daily_pct <= -self.config['daily_loss_limit_pct']:
+                self.logger.warning("Daily loss limit reached, pausing trading until next day")
+                self.send_discord_notification(f"⚠️ DAILY LOSS LIMIT reached: {daily_pct:.2%}. No new trades today.", color=0xff6600)
                 return False
-            
             return True
-            
         except Exception as e:
-            self.logger.error(f"Error in risk management check: {e}")
-            return True  # Allow trading if risk check fails
-    
-    def check_correlation(self, new_symbol):
-        """Check if new symbol is too correlated with existing positions"""
-        if not self.positions:
-            return True  # No existing positions, no correlation risk
-        
-        # Simple correlation check based on asset type
-        # More sophisticated correlation would require price data analysis
-        crypto_pairs = {
-            'BTC/USD': 'bitcoin',
-            'ETH/USD': 'ethereum', 
-            'ADA/USD': 'altcoin',
-            'LINK/USD': 'altcoin',
-            'DOT/USD': 'altcoin'
-        }
-        
-        new_type = crypto_pairs.get(new_symbol, 'unknown')
-        
-        # Count positions of same type
-        same_type_count = 0
-        for symbol in self.positions.keys():
-            if crypto_pairs.get(symbol, 'unknown') == new_type and new_type == 'altcoin':
-                same_type_count += 1
-        
-        # Don't allow more than 1 altcoin position at once
-        if new_type == 'altcoin' and same_type_count >= 1:
-            self.logger.warning(f"Correlation risk: Already holding altcoin position, skipping {new_symbol}")
-            return False
-        
-        return True
-    
-    def get_portfolio_exposure(self):
-        """Calculate current portfolio exposure"""
-        try:
-            balance = self.exchange.fetch_balance()
-            total_usd = balance['total'].get('USD', 0)
-            
-            exposure = 0
-            for symbol, position in self.positions.items():
-                current_price = self.exchange.fetch_ticker(symbol)['last']
-                position_value = position['amount'] * current_price
-                exposure += position_value
-            
-            exposure_pct = (exposure / total_usd) * 100 if total_usd > 0 else 0
-            
-            self.logger.info(f"Portfolio exposure: ${exposure:.2f} ({exposure_pct:.1f}% of balance)")
-            return exposure_pct
-            
-        except Exception as e:
-            self.logger.error(f"Error calculating portfolio exposure: {e}")
-            return 0
-        
-    def reset_emergency_stop(self):
-        """Manually reset emergency stop (use with caution)"""
-        self.emergency_stop = False
-        self.logger.info("Emergency stop manually reset")
-        self.send_discord_notification(
-            "🟢 **EMERGENCY STOP RESET**\n"
-            "Trading has been manually re-enabled\n"
-            "⚠️ Monitor carefully",
-            color=0x00ff00
-        )
-        
-    def calculate_indicators(self, df):
-        """Calculate moving averages, RSI, volume, and momentum indicators on the DataFrame"""
-        # Moving averages
-        df['ma_short'] = SMAIndicator(df['close'], window=self.config['short_ma_period']).sma_indicator()
-        df['ma_long'] = SMAIndicator(df['close'], window=self.config['long_ma_period']).sma_indicator()
-        
-        # RSI - using ta library's RSI function
-        df['rsi'] = RSIIndicator(df['close'], window=self.config['rsi_period']).rsi()
-        
-        # Volume moving average for confirmation
-        df['volume_ma'] = SMAIndicator(df['volume'], window=self.config['volume_ma_period']).sma_indicator()
-        df['volume_ratio'] = df['volume'] / df['volume_ma']
-        
-        # Momentum: price above both MAs
-        df['above_mas'] = (df['close'] > df['ma_short']) & (df['close'] > df['ma_long'])
-        
-        # Count consecutive periods above MAs
-        df['momentum_count'] = 0
-        for i in range(1, len(df)):
-            if df['above_mas'].iloc[i]:
-                if df['above_mas'].iloc[i-1]:
-                    df.loc[df.index[i], 'momentum_count'] = df['momentum_count'].iloc[i-1] + 1
-                else:
-                    df.loc[df.index[i], 'momentum_count'] = 1
-            else:
-                df.loc[df.index[i], 'momentum_count'] = 0
-        
-        return df
+            self.logger.error(f"check_risk_management error: {e}\n{traceback.format_exc()}")
+            return True
 
-    def process_symbol(self, symbol):
-        """Process trading logic for a single symbol"""
-        try:
-            self.logger.info(f"Processing {symbol}")
-            
-            # Get historical data
-            df = self.get_historical_data(symbol, self.config['timeframe'])
-            if df is None or len(df) < self.config['long_ma_period']:
-                self.logger.warning(f"Insufficient data for {symbol}")
-                return
-                
-            # Calculate indicators and signals
-            df = self.calculate_indicators(df)
-            signals = self.generate_signals(df)
-            
-            self.logger.info(f"{symbol} - Price: ${signals['price']:.2f}, RSI: {signals['rsi']:.1f}, "
-                           f"MA Short: ${signals['ma_short']:.2f}, MA Long: ${signals['ma_long']:.2f}")
-            self.logger.info(f"{symbol} DEBUG - MA Gap: {signals.get('ma_gap_pct', 0):.2f}%, "
-                           f"Price Ext: {signals.get('price_ext_pct', 0):.2f}%, "
-                           f"Volume: {signals.get('volume_ratio', 0):.2f}x, "
-                           f"Momentum: {signals.get('momentum_count', 0)} periods, "
-                           f"Vol OK: {signals.get('volume_confirmed', False)}, "
-                           f"Mom OK: {signals.get('momentum_confirmed', False)}, "
-                           f"Safe Uptrend: {signals.get('safe_uptrend', False)}, "
-                           f"Buy: {signals.get('buy', False)}")
-            
-            # Check if we have an open position
-            has_position = symbol in self.positions
-            
-            # Log position status for debugging
-            if has_position:
-                position = self.positions[symbol]
-                current_price = signals['price']
-                entry_price = position['entry_price']
-                pnl_pct = (current_price - entry_price) / entry_price
-                self.logger.info(f"{symbol} - POSITION ACTIVE: Entry ${entry_price:.2f}, Current ${current_price:.2f}, P&L: {pnl_pct:.2%}")
-            else:
-                self.logger.info(f"{symbol} - NO POSITION")
-            
-            if has_position:
-                # Check stop loss / take profit
-                sl_tp_action = self.check_stop_loss_take_profit(symbol, self.positions[symbol])
-                if sl_tp_action == 'sell':
-                    amount = self.positions[symbol]['amount']
-                    order = self.place_order(symbol, 'sell', amount, signals['price'])
-                    if order:
-                        self.logger.info(f"POSITION CLOSED for {symbol} via stop/take profit")
-                        del self.positions[symbol]
-                        self.save_state()  # Save immediately after position removal
-                        return
-                        
-                # Check sell signal
-                if signals['sell']:
-                    self.logger.info(f"Sell signal for {symbol}")
-                    
-                    # Send Discord notification for sell signal
-                    amount = self.positions[symbol]['amount']
-                    entry_price = self.positions[symbol]['entry_price']
-                    current_price = signals['price']
-                    pnl_pct = (current_price - entry_price) / entry_price
-                    
-                    self.send_discord_notification(
-                        f"📉 **SELL SIGNAL DETECTED**\n"
-                        f"Symbol: {symbol}\n"
-                        f"Entry Price: ${entry_price:.2f}\n"
-                        f"Current Price: ${current_price:.2f}\n"
-                        f"P&L: {pnl_pct:.2%}\n"
-                        f"RSI: {signals['rsi']:.1f}",
-                        color=0xff6600  # Orange for sell signal
-                    )
-                    
-                    order = self.place_order(symbol, 'sell', amount, signals['price'])
-                    if order:
-                        self.logger.info(f"POSITION CLOSED for {symbol} via sell signal")
-                        del self.positions[symbol]
-                        self.save_state()  # Save immediately after position removal
-                        
-            else:
-                # Check buy signal
-                if signals['buy']:
-                    # Risk management checks before buying
-                    if self.emergency_stop:
-                        self.logger.warning(f"Emergency stop active - skipping buy signal for {symbol}")
-                        return
-                    
-                    if not self.check_risk_management():
-                        self.logger.warning(f"Risk management check failed - skipping buy signal for {symbol}")
-                        return
-                    
-                    if not self.check_correlation(symbol):
-                        self.logger.warning(f"Correlation check failed - skipping buy signal for {symbol}")
-                        return
-                    
-                    # Check portfolio exposure
-                    exposure = self.get_portfolio_exposure()
-                    if exposure > 80:  # Don't exceed 80% portfolio exposure
-                        self.logger.warning(f"Portfolio exposure too high ({exposure:.1f}%) - skipping buy signal for {symbol}")
-                        return
-                    
-                    self.logger.info(f"Buy signal for {symbol}")
-                    
-                    # Send Discord notification for buy signal
-                    self.send_discord_notification(
-                        f"📈 **BUY SIGNAL DETECTED**\n"
-                        f"Symbol: {symbol}\n"
-                        f"Price: ${signals['price']:.2f}\n"
-                        f"RSI: {signals['rsi']:.1f}\n"
-                        f"MA Short: ${signals['ma_short']:.2f}\n"
-                        f"MA Long: ${signals['ma_long']:.2f}",
-                        color=0x00aa00  # Green for buy signal
-                    )
-                    
-                    amount = self.calculate_position_size(symbol, signals['price'])
-                    if amount > 0:
-                        order = self.place_order(symbol, 'buy', amount, signals['price'])
-                        if order:
-                            # Create position record
-                            position_data = {
-                                'side': 'buy',
-                                'amount': amount,
-                                'entry_price': signals['price'],
-                                'highest_price': signals['price'],  # Initialize trailing stop
-                                'timestamp': datetime.now().isoformat()
-                            }
-                            self.positions[symbol] = position_data
-                            
-                            # Validate position was saved
-                            self.logger.info(f"POSITION CREATED for {symbol}: {position_data}")
-                            self.logger.info(f"Active positions: {list(self.positions.keys())}")
-                            
-                            # Force save state immediately after position creation
-                            self.save_state()
-                            
-        except Exception as e:
-            self.logger.error(f"Error processing {symbol}: {e}")
-            
-    def save_state(self):
-        """Save bot state to file"""
-        state = {
-            'positions': self.positions,
-            'trade_history': self.trade_history[-100:],  # Keep last 100 trades
-            'emergency_stop': self.emergency_stop,
-            'session_start_balance': self.session_start_balance,
-            'peak_balance': self.peak_balance,
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        with open('bot_state.json', 'w') as f:
-            json.dump(state, f, indent=2)
-            
-    def load_state(self):
-        """Load bot state from file"""
-        try:
-            with open('bot_state.json', 'r') as f:
-                state = json.load(f)
-                self.positions = state.get('positions', {})
-                self.trade_history = state.get('trade_history', [])
-                self.emergency_stop = state.get('emergency_stop', False)
-                self.session_start_balance = state.get('session_start_balance', 0.0)
-                self.peak_balance = state.get('peak_balance', 0.0)
-                
-                if self.emergency_stop:
-                    self.logger.warning("Emergency stop was previously activated")
-                
-                self.logger.info("Bot state loaded successfully")
-        except FileNotFoundError:
-            self.logger.info("No previous state found, starting fresh")
-        except Exception as e:
-            self.logger.error(f"Error loading state: {e}")
-            
+    # ---------------------------
+    # Main loop
+    # ---------------------------
     def run(self):
-        """Main bot loop"""
-        if self.config['paper_trading']:
-            self.logger.info("[PAPER] Starting Crypto Trading Bot in PAPER TRADING MODE (no real money)")
-            # Send Discord startup notification
-            self.send_discord_notification(
-                f"🟡 **BOT STARTED - PAPER TRADING MODE**\n"
-                f"Symbols: {', '.join(self.config['symbols'])}\n"
-                f"Check Interval: {self.config['check_interval']}s\n"
-                f"⚠️ No real money will be used",
-                color=0xffaa00  # Orange for paper trading
-            )
-        else:
-            self.logger.info("[LIVE] Starting Crypto Trading Bot in LIVE TRADING MODE (real money)")
-            # Send Discord startup notification
-            self.send_discord_notification(
-                f"🟢 **BOT STARTED - LIVE TRADING MODE**\n"
-                f"Symbols: {', '.join(self.config['symbols'])}\n"
-                f"Check Interval: {self.config['check_interval']}s\n"
-                f"💰 Real money trading active!",
-                color=0x00ff00  # Green for live trading
-            )
-            
-        self.load_state()
-        
-        # Log current positions on startup
-        if self.positions:
-            self.logger.info(f"Resuming with {len(self.positions)} active positions: {list(self.positions.keys())}")
-            for symbol, position in self.positions.items():
-                self.logger.info(f"  {symbol}: Entry ${position['entry_price']:.2f} at {position['timestamp']}")
-        else:
-            self.logger.info("Starting with no active positions")
-        
+        """Main loop: signal detection, execution, position management"""
         try:
+            # Startup message
+            mode = "PAPER" if self.config['paper_trading'] else "LIVE"
+            self.logger.info(f"Starting CryptoTradingBot ({mode}) with symbols: {self.config['symbols']}")
+            self.logger.info(f"Position management every {self.config['check_interval']}s, Entry scans every {self.config['entry_scan_interval']}s")
+            self.send_discord_notification(f"🟡 Bot started ({mode}). Symbols: {', '.join(self.config['symbols'])}", color=0x00aa00)
+
+            # Calculate how many position management cycles before doing entry scan
+            cycles_per_entry_scan = max(1, int(self.config['entry_scan_interval'] / self.config['check_interval']))
+            cycle_count = 0
+
             while True:
-                self.logger.info("=== Starting trading cycle ===")
-                
-                # Emergency stop check
-                if self.emergency_stop:
-                    self.logger.error("Emergency stop is active - trading disabled")
-                    time.sleep(self.config['check_interval'])
-                    continue
-                
-                # Perform risk management check at start of each cycle
-                if not self.check_risk_management():
-                    self.logger.warning("Risk management check failed - skipping this cycle")
-                    time.sleep(self.config['check_interval'])
-                    continue
-                
-                for symbol in self.config['symbols']:
-                    self.process_symbol(symbol)
-                    time.sleep(2)  # Rate limiting between symbols
+                try:
+                    cycle_ts = datetime.now(timezone.utc).isoformat(timespec='seconds')
+                    is_entry_scan_cycle = (cycle_count % cycles_per_entry_scan) == 0
                     
-                self.save_state()
-                
-                self.logger.info(f"Cycle complete. Sleeping for {self.config['check_interval']} seconds...")
-                time.sleep(self.config['check_interval'])
-                
-        except KeyboardInterrupt:
-            self.logger.info("Bot stopped by user")
-            self.send_discord_notification(
-                "🔴 **BOT STOPPED**\n"
-                "Bot manually stopped by user",
-                color=0xff0000  # Red for stop
-            )
-        except Exception as e:
-            self.logger.error(f"Bot error: {e}")
-            self.send_discord_notification(
-                f"❌ **BOT ERROR**\n"
-                f"Error: {str(e)}\n"
-                f"Bot may have crashed!",
-                color=0xff0000  # Red for error
-            )
-            raise
+                    if is_entry_scan_cycle:
+                        self.logger.info(f"=== FULL CYCLE (Entry + Position Management) @ {cycle_ts} ===")
+                    else:
+                        self.logger.info(f"=== POSITION MANAGEMENT CYCLE @ {cycle_ts} ===")
+                    
+                    if self.emergency_stop:
+                        self.logger.error("Emergency stop active - sleeping until manual reset")
+                        time.sleep(self.config['check_interval'])
+                        cycle_count += 1
+                        continue
+
+                    if not self.check_risk_management():
+                        # skip cycle if risk rules fail
+                        time.sleep(self.config['check_interval'])
+                        cycle_count += 1
+                        continue
+
+                    # ALWAYS manage existing positions (check SL/TP/trailing/time exits)
+                    if self.positions:
+                        self.logger.info(f"Managing {len(self.positions)} open position(s): {list(self.positions.keys())}")
+                        self.manage_positions_cycle()
+
+                    # Only scan for new entries every entry_scan_interval
+                    signals = []  # Initialize signals for summary
+                    if is_entry_scan_cycle:
+                        # enforce max concurrent positions
+                        if len(self.positions) >= self.config['max_concurrent_positions']:
+                            self.logger.info(f"Max concurrent positions reached ({len(self.positions)}) - skipping new entries")
+                        else:
+                            # Evaluate signals for all symbols and execute up to available slots
+                            self.logger.info(f"📊 EVALUATING SIGNALS for {len(self.config['symbols'])} symbols...")
+                            
+                            for symbol in self.config['symbols']:
+                                try:
+                                    dfs = self.fetch_multi_tf(symbol, limit_1m=720)  # e.g., last 12 hours of 1m bars
+                                    if dfs is None:
+                                        time.sleep(self.config['rate_limit_sleep'])
+                                        continue
+                                    result = self.check_entry_conditions(symbol, dfs)
+                                    # attach more info
+                                    result['symbol'] = symbol
+                                    result['current_price'] = result.get('price') or (dfs['15m']['close'].iloc[-1] if dfs['15m'] is not None else None)
+                                    signals.append(result)
+                                except Exception as e:
+                                    self.logger.error(f"Signal evaluation error for {symbol}: {e}\n{traceback.format_exc()}")
+                                time.sleep(self.config['rate_limit_sleep'])
+
+                            # Rank signals by simple priority: prefer ones with all_ok and higher vol_ratio
+                            ranked = [s for s in signals if s.get('symbol') and s.get('buy')]
+                            # also keep those with reason 'all_ok' first
+                            ranked = sorted(ranked, key=lambda x: (0 if x.get('reason') == 'all_ok' else 1, -x.get('vol_ratio', 0)))
+                            slots = self.config['max_concurrent_positions'] - len(self.positions)
+                            for sig in ranked[:slots]:
+                                sym = sig['symbol']
+                                # Re-check correlation and exposure
+                                if not self.check_correlation(sym):
+                                    self.logger.info(f"Skipping {sym} due to correlation check")
+                                    continue
+                                # calculate amount in base units
+                                price = float(sig['current_price']) if sig.get('current_price') else None
+                                if not price or price <= 0:
+                                    self.logger.warning(f"Invalid price for {sym}, skipping")
+                                    continue
+                                amount = self.calculate_position_amount(sym, price)
+                                if amount <= 0:
+                                    self.logger.info(f"Calculated amount for {sym} is zero, skipping")
+                                    continue
+                                # execute buy
+                                self.logger.info(f"Executing entry for {sym}: amount={amount}, price={price}")
+                                order = self.execute_entry(sym, amount, price)
+                                if order:
+                                    # create position record
+                                    pos = {
+                                        'side': 'buy',
+                                        'amount': amount,
+                                        'entry_price': price,
+                                        'timestamp': datetime.now(timezone.utc).isoformat(),
+                                        'highest_price': price,
+                                        'partial_taken': False,
+                                        'trailing_active': False
+                                    }
+                                    self.positions[sym] = pos
+                                    self.logger.info(f"Position opened: {sym} amount={amount} entry={price}")
+                                    self.save_state()
+                                time.sleep(self.config['rate_limit_sleep'])
+
+                    # End of cycle housekeeping
+                    self.save_state()
+                    
+                    # Cycle Summary
+                    if is_entry_scan_cycle:
+                        buy_signals = [s for s in signals if s.get('buy')]
+                        total_evaluated = len(signals)
+                        self.logger.info(f"📋 FULL CYCLE SUMMARY:")
+                        self.logger.info(f"   📊 Symbols Evaluated: {total_evaluated}")
+                        self.logger.info(f"   🟢 Buy Signals: {len(buy_signals)}")
+                        self.logger.info(f"   📈 Active Positions: {len(self.positions)} ({list(self.positions.keys())})")
+                        self.logger.info(f"   ⏳ Next entry scan in {self.config['entry_scan_interval']}s")
+                        self.logger.info(f"   {'='*60}")
+                    else:
+                        self.logger.info(f"📋 POSITION MANAGEMENT SUMMARY:")
+                        self.logger.info(f"   📈 Active Positions: {len(self.positions)} ({list(self.positions.keys())})")
+                        remaining_cycles = cycles_per_entry_scan - (cycle_count % cycles_per_entry_scan) - 1
+                        self.logger.info(f"   ⏳ Next entry scan in {remaining_cycles * self.config['check_interval']}s ({remaining_cycles} cycles)")
+                        self.logger.info(f"   {'='*60}")
+                    
+                    cycle_count += 1
+                    time.sleep(self.config['check_interval'])
+
+                except KeyboardInterrupt:
+                    self.logger.info("Bot stopped by user interrupt")
+                    self.send_discord_notification("🔴 Bot stopped by user", color=0xff0000)
+                    break
+                except Exception as e:
+                    self.logger.error(f"Unexpected error in main loop: {e}\n{traceback.format_exc()}")
+                    self.send_discord_notification(f"❌ Bot error: {e}", color=0xff0000)
+                    cycle_count += 1
+                    time.sleep(self.config['check_interval'])
         finally:
             self.save_state()
-            self.logger.info("Bot shutdown complete")
+            self.logger.info("Bot shutdown - state saved")
 
 if __name__ == "__main__":
     bot = CryptoTradingBot()
