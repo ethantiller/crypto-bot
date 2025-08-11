@@ -1064,22 +1064,9 @@ class CryptoTradingBot:
                 time_since_trade = (datetime.now(timezone.utc) - last_trade_time).total_seconds()
                 recent_trade = time_since_trade < 60  # Within last 60 seconds
                 
-            bal = None
-            try:
-                bal = self.exchange.fetch_balance()
-            except Exception as e:
-                self.logger.warning(f"Could not fetch balance: {e}")
-                # in paper mode simulate
-            current_usd = 0.0
-            if bal:
-                # try typical keys
-                for key in ['USD', 'ZUSD', 'USDT']:
-                    if key in bal.get('total', {}) and bal['total'][key] is not None:
-                        current_usd = float(bal['total'][key])
-                        break
-            else:
-                current_usd = self.session_start_balance if self.session_start_balance > 0 else 95.0
-
+            # Use the corrected portfolio calculation that includes crypto holdings
+            current_usd = self.get_portfolio_usd()
+            
             if self.session_start_balance == 0.0:
                 self.session_start_balance = current_usd
                 self.peak_balance = current_usd
