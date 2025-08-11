@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Full Crypto Trading Bot implementing AGGRESSIVE STRATEGY:
+Full Crypto Trading Bot implementing IMPROVED PROFIT-TAKING STRATEGY:
 - EMA21 > EMA50 on 1H (no cross required) with 4H confirmation
-- RSI14 between 30-70 (relaxed from 40-60), MACD(12,26,9) with relaxed negative tolerance in strong trends, Volume >60% MA20, ATR14
+- RSI14 between 30-70, MACD(12,26,9) with tolerance in strong trends, Volume >60% MA20, ATR14
 - No 15m confirmation required (moderate)
 - Position sizing with BTC/ETH min $16, ADA/XRP/SOL target 15% each
-- Max 5 concurrent positions (increased from 3), larger position caps 25%
-- Relaxed stop/take/partial/trailing levels for moderate risk
+- Max 5 concurrent positions, per-asset caps 25%
+- IMPROVED RISK MANAGEMENT: 2.5% stop loss, 2.5% partial TP, 5% final TP, 1.5% trailing
 - No time window restrictions (24/7 trading)
 - Discord notifications, bot_state.json persistence, comprehensive logging
 - Market orders for execution (paper trading supported)
-- AGGRESSIVE FEATURES: Lower volume threshold (60%), MACD tolerance in strong trends
+- OPTIMIZED FEATURES: Realistic profit targets, better risk/reward ratios
 """
 
 import ccxt
@@ -124,12 +124,12 @@ class CryptoTradingBot:
             'others_target_pct': 0.15,   # Increased from 10% to 15% for alt coins
             'max_concurrent_positions': 5, # Increased from 3 to 5
             'per_asset_cap_pct': 0.25,   # Increased from 20% to 25% cap
-            # Risk management - MODERATE SETTINGS
-            'stop_loss_pct': 0.03,       # Relaxed from 2% to 3%
-            'partial_tp_pct': 0.05,      # Relaxed from 3% to 5%
-            'primary_tp_pct': 0.07,      # Relaxed from 5% to 7%
-            'trailing_activate_pct': 0.05, # Relaxed from 3% to 5%
-            'trailing_pct': 0.02,        # Relaxed from 1.5% to 2%
+            # Risk management - IMPROVED PROFIT TAKING
+            'stop_loss_pct': 0.025,      # Slightly tighter: 2.5% stop loss for better risk/reward
+            'partial_tp_pct': 0.025,     # First profit taking at 2.5% (much more achievable)
+            'primary_tp_pct': 0.05,      # Final exit at 5% (reduced from 7%)
+            'trailing_activate_pct': 0.025, # Activate trailing at first TP level
+            'trailing_pct': 0.015,       # Tighter trailing: 1.5% below highest
             'time_exit_hours': 72,       # Increased from 48 to 72 hours
             # Safety
             'daily_loss_limit_pct': 0.05,  # 5% daily loss limit -> stop trading
