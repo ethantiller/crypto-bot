@@ -717,6 +717,7 @@ class CryptoTradingBot:
             
             # Get USD cash balance first
             usd_keys = ['USD', 'ZUSD', 'USDT']  # Kraken uses ZUSD sometimes; but prefer USD
+            cash_usd = 0.0
             for k in usd_keys:
                 if k in bal.get('total', {}) and bal['total'][k] is not None:
                     cash_usd = float(bal['total'][k])
@@ -724,7 +725,31 @@ class CryptoTradingBot:
                     self.logger.debug(f"Cash USD balance ({k}): ${cash_usd:.2f}")
                     break
             
-            # Add value of crypto holdings
+            # Add value of crypto holdings using position data and current prices
+            crypto_value_total = 0.0
+            for symbol, position in self.positions.items():
+                try:
+                    # Get current market price
+                    ticker = self.exchange.fetch_ticker(symbol)
+                    if ticker and ticker.get('last') is not None:
+                        current_price = float(ticker['last'])  # type: ignore
+                        position_amount = float(position['amount'])
+                        crypto_value_usd = position_amount * current_price
+                        crypto_value_total += crypto_value_usd
+                        self.logger.debug(f"Position {symbol}: {position_amount:.6f} @ ${current_price:.2f} = ${crypto_value_usd:.2f}")
+                except Exception as e:
+                    self.logger.debug(f"Could not get current price for position {symbol}: {e}")
+                    # Fallback to entry price if current price unavailable
+                    try:
+                        entry_price = float(position['entry_price'])
+                        position_amount = float(position['amount'])
+                        crypto_value_usd = position_amount * entry_price
+                        crypto_value_total += crypto_value_usd
+                        self.logger.debug(f"Position {symbol} (entry price): {position_amount:.6f} @ ${entry_price:.2f} = ${crypto_value_usd:.2f}")
+                    except Exception as e2:
+                        self.logger.warning(f"Could not calculate value for position {symbol}: {e2}")
+            
+            # Also check for crypto holdings not in tracked positions (from exchange balance)
             crypto_symbols = ['BTC', 'ETH', 'ADA', 'XRP', 'SOL', 'XETH', 'XXBT', 'XXRP']  # Include Kraken prefixed versions
             for symbol in crypto_symbols:
                 if symbol in bal.get('total', {}) and bal['total'][symbol] is not None:
@@ -734,18 +759,23 @@ class CryptoTradingBot:
                             # Get the trading pair symbol for price lookup
                             pair_symbol = f"{symbol.replace('X', '')}/USD"  # Remove Kraken X prefix
                             if pair_symbol in ['BTC/USD', 'ETH/USD', 'ADA/USD', 'XRP/USD', 'SOL/USD']:
+                                # Skip if we already counted this in positions
+                                if pair_symbol in self.positions:
+                                    continue
+                                    
                                 ticker = self.exchange.fetch_ticker(pair_symbol)
                                 if ticker and ticker.get('last') is not None:
                                     last_price = ticker['last']
                                     if last_price is not None:
                                         crypto_price = float(last_price)
                                         crypto_value_usd = crypto_amount * crypto_price
-                                        total_usd += crypto_value_usd
-                                        self.logger.debug(f"{symbol}: {crypto_amount:.6f} @ ${crypto_price:.2f} = ${crypto_value_usd:.2f}")
+                                        crypto_value_total += crypto_value_usd
+                                        self.logger.debug(f"Untracked {symbol}: {crypto_amount:.6f} @ ${crypto_price:.2f} = ${crypto_value_usd:.2f}")
                         except Exception as e:
-                            self.logger.debug(f"Could not get price for {symbol}: {e}")
-                            
-            self.logger.debug(f"Total portfolio value: ${total_usd:.2f}")
+                            self.logger.debug(f"Could not get price for untracked {symbol}: {e}")
+            
+            total_usd += crypto_value_total            
+            self.logger.debug(f"Total portfolio value: ${cash_usd:.2f} cash + ${crypto_value_total:.2f} crypto = ${total_usd:.2f}")
             return float(total_usd)
         except Exception as e:
             self.logger.warning(f"get_portfolio_usd error: {e}")
@@ -1104,8 +1134,8 @@ class CryptoTradingBot:
             self.emergency_stop = False
             current_usd = self.get_portfolio_usd()
             self.peak_balance = current_usd  # Reset peak to current balance
-            self.logger.info(f"Emergency stop reset. New peak balance: ${self.peak_balance:.2f}")
-            self.send_discord_notification(f"✅ Emergency stop reset. Peak balance: ${self.peak_balance:.2f}", color=0x00ff00)
+            self.logger.info(f"🚨 Emergency stop reset automatically. Current portfolio: ${current_usd:.2f}, New peak: ${self.peak_balance:.2f}")
+            self.send_discord_notification(f"✅ Emergency stop reset automatically. Portfolio: ${current_usd:.2f}", color=0x00ff00)
             self.save_state()
         except Exception as e:
             self.logger.error(f"reset_emergency_stop error: {e}")
