@@ -264,11 +264,11 @@ class CryptoTradingBot:
             df1h['timestamp'] = pd.to_datetime(df1h['timestamp'], unit='ms')
             df1h.set_index('timestamp', inplace=True)
             
-            # Fetch 4h data directly (need ~20 for trend confirmation)
+            # Fetch 4h data directly (need ~60 for EMA50 calculation)
             self.logger.debug(f"Fetching 4h data for {symbol}")
-            ohlcv_4h = self.exchange.fetch_ohlcv(symbol, '4h', limit=30)
-            if not ohlcv_4h or len(ohlcv_4h) < 20:
-                self.logger.warning(f"Insufficient 4h data for {symbol}: {len(ohlcv_4h) if ohlcv_4h else 0}")
+            ohlcv_4h = self.exchange.fetch_ohlcv(symbol, '4h', limit=60)
+            if not ohlcv_4h or len(ohlcv_4h) < 50:
+                self.logger.warning(f"Insufficient 4h data for {symbol}: {len(ohlcv_4h) if ohlcv_4h else 0} (need 50+ for EMA50)")
                 return None
                 
             df4h = pd.DataFrame(ohlcv_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
