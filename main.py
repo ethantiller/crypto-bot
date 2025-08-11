@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Full Crypto Trading Bot implementing:
-- EMA21/EMA50 cross on 1H with 4H confirmation
-- RSI14, MACD(12,26,9), Volume MA20, ATR14
-- 15m confirmation for entry execution
-- Position sizing with BTC/ETH min $16, ADA/XRP/SOL target 10% each
-- Max 3 concurrent positions, equal-weight protection, stop/take/partial/trailing
-- Discord notifications, bot_state.json persistence, trading_bot.log logging
+Full Crypto Trading Bot implementing MODERATE STRATEGY:
+- EMA21 > EMA50 on 1H (no cross required) with 4H confirmation
+- RSI14 between 30-70 (relaxed from 40-60), MACD(12,26,9), Volume >80% MA20, ATR14
+- No 15m confirmation required (moderate)
+- Position sizing with BTC/ETH min $16, ADA/XRP/SOL target 15% each
+- Max 5 concurrent positions (increased from 3), larger position caps 25%
+- Relaxed stop/take/partial/trailing levels for moderate risk
+- No time window restrictions (24/7 trading)
+- Discord notifications, bot_state.json persistence, comprehensive logging
 - Market orders for execution (paper trading supported)
 """
 
@@ -105,24 +107,24 @@ class CryptoTradingBot:
             'macd_signal': 9,
             'vol_ma_period': 20,
             'atr_period': 14,
-            # Entry filters
-            'rsi_entry_low': 40,
-            'rsi_entry_high': 60,
-            'rsi_hard_upper': 70,
-            'rsi_hard_lower': 30,
-            'max_recent_move_pct': 5.0,  # avoid if >5% in last 2 hours
-            # Position sizing rules
+            # Entry filters - MODERATE SETTINGS
+            'rsi_entry_low': 30,         # Relaxed from 40 to 30
+            'rsi_entry_high': 70,        # Relaxed from 60 to 70
+            'rsi_hard_upper': 80,        # Relaxed from 70 to 80
+            'rsi_hard_lower': 20,        # Relaxed from 30 to 20
+            'max_recent_move_pct': 8.0,  # Relaxed from 5% to 8%
+            # Position sizing rules - MODERATE SETTINGS
             'btc_eth_min_value': 16.0,   # minimum $16 position for BTC and ETH
-            'others_target_pct': 0.10,   # 10% target allocation for ADA, XRP, SOL
-            'max_concurrent_positions': 3,
-            'per_asset_cap_pct': 0.20,   # 20% cap per asset
-            # Risk management
-            'stop_loss_pct': 0.02,       # 2% fixed stop loss
-            'partial_tp_pct': 0.03,      # 3% partial take profit (50% of pos)
-            'primary_tp_pct': 0.05,      # default 5% primary take profit (between 4-6%)
-            'trailing_activate_pct': 0.03, # activate trailing after +3%
-            'trailing_pct': 0.015,       # 1.5% trailing
-            'time_exit_hours': 48,       # time-based exit if no movement
+            'others_target_pct': 0.15,   # Increased from 10% to 15% for alt coins
+            'max_concurrent_positions': 5, # Increased from 3 to 5
+            'per_asset_cap_pct': 0.25,   # Increased from 20% to 25% cap
+            # Risk management - MODERATE SETTINGS
+            'stop_loss_pct': 0.03,       # Relaxed from 2% to 3%
+            'partial_tp_pct': 0.05,      # Relaxed from 3% to 5%
+            'primary_tp_pct': 0.07,      # Relaxed from 5% to 7%
+            'trailing_activate_pct': 0.05, # Relaxed from 3% to 5%
+            'trailing_pct': 0.02,        # Relaxed from 1.5% to 2%
+            'time_exit_hours': 72,       # Increased from 48 to 72 hours
             # Safety
             'daily_loss_limit_pct': 0.05,  # 5% daily loss limit -> stop trading
             'max_drawdown_pct': 0.05,      # 5% peak drawdown emergency stop
@@ -357,62 +359,81 @@ class CryptoTradingBot:
             self.logger.debug(f"check_15m_confirmation error: {e}")
             return False
 
+    def log_detailed_analysis(self, symbols_data, cycle_ts):
+        """Log detailed analysis for each cryptocurrency showing all indicators and conditions"""
+        try:
+            portfolio_usd = self.get_portfolio_usd()
+        except:
+            portfolio_usd = 95.0  # Fallback
+            
+        self.logger.info(f"🔍 DETAILED CRYPTO ANALYSIS @ {cycle_ts}")
+        self.logger.info(f"   💰 Balance: ${portfolio_usd:.2f} | Active Positions: {len(self.positions)} | Next Scan: {self.config['entry_scan_interval']}s")
+        self.logger.info(f"   � Open Positions: {list(self.positions.keys()) if self.positions else 'None'}")
+        self.logger.info(f"   {'='*80}")
+        
+        for data in symbols_data:
+            symbol = data.get('symbol', 'UNKNOWN')
+            price = data.get('price', 0)
+            
+            # Extract all condition data
+            ema21_1h = data.get('ema21_1h', 0)
+            ema50_1h = data.get('ema50_1h', 0)
+            ema21_4h = data.get('ema21_4h', 0)
+            ema50_4h = data.get('ema50_4h', 0)
+            rsi = data.get('rsi', 0)
+            macd_hist = data.get('macd_hist', 0)
+            macd_delta = data.get('macd_delta', 0)
+            vol_ratio = data.get('vol_ratio', 0)
+            recent_move = data.get('recent_move_pct', 0)
+            
+            # Condition checks
+            ma_cross = data.get('ma_cross_up', False)
+            trend_confirm = data.get('trend_confirm', False)
+            rsi_ok = self.config['rsi_entry_low'] <= rsi <= self.config['rsi_entry_high']
+            macd_ok = data.get('macd_ok', False)
+            vol_ok = data.get('vol_ok', False)
+            move_ok = recent_move <= self.config['max_recent_move_pct']
+            confirm15 = data.get('15m_confirm', True)
+            time_ok = not data.get('time_blocked', False)
+            
+            # Overall signal
+            buy_signal = data.get('buy', False)
+            reason = data.get('reason', 'unknown')
+            
+            # Format the line
+            signal_icon = "🟢 BUY" if buy_signal else "🔴 NO BUY"
+            
+            self.logger.info(f"   {symbol:8s} | {signal_icon:8s} | ${price:8.2f} | "
+                           f"EMA21/50(1h): {ema21_1h:7.2f}/{ema50_1h:7.2f} {'✅' if ma_cross else '❌'} | "
+                           f"EMA21/50(4h): {ema21_4h:7.2f}/{ema50_4h:7.2f} {'✅' if trend_confirm else '❌'}")
+            
+            spacing = " " * 8
+            self.logger.info(f"   {spacing} | RSI: {rsi:5.1f} {'✅' if rsi_ok else '❌'} | "
+                           f"MACD: H={macd_hist:6.4f} D={macd_delta:6.4f} {'✅' if macd_ok else '❌'} | "
+                           f"Vol: {vol_ratio:4.2f}x {'✅' if vol_ok else '❌'} | "
+                           f"Move: {recent_move:4.1f}% {'✅' if move_ok else '❌'}")
+            
+            if not buy_signal:
+                self.logger.info(f"   {spacing} | Reason: {reason}")
+            
+            self.logger.info(f"   {'-'*80}")
+
     def log_condition_check(self, symbol, conditions):
-        """Log detailed condition check results in a readable format"""
-        self.logger.info(f"🔍 ENTRY CONDITIONS CHECK for {symbol}:")
-        self.logger.info(f"   📊 Price: ${conditions.get('price', 0):.4f}")
+        """Log detailed condition check results in a readable format - ENHANCED"""
+        # Store this data for batch logging later
+        if not hasattr(self, '_symbol_data_cache'):
+            self._symbol_data_cache = []
         
-        # EMA Cross Check
-        ema_prev = conditions.get('ema_spread_prev', 0)
-        ema_now = conditions.get('ema_spread_now', 0) 
-        cross_status = "✅ PASS" if conditions.get('ma_cross_up') else "❌ FAIL"
-        self.logger.info(f"   📈 1H EMA Cross (21>50): {cross_status} | Prev: {ema_prev:.5f} → Now: {ema_now:.5f}")
-        
-        # 4H Trend Check
-        trend_status = "✅ PASS" if conditions.get('trend_confirm') else "❌ FAIL"
-        trend_spread = conditions.get('trend_spread', 0)
-        self.logger.info(f"   📊 4H Trend Confirm: {trend_status} | EMA21-EMA50: {trend_spread:.5f}")
-        
-        # RSI Check
-        rsi = conditions.get('rsi', 0)
-        rsi_low = self.config['rsi_entry_low']
-        rsi_high = self.config['rsi_entry_high']
-        rsi_ok = rsi_low <= rsi <= rsi_high
-        rsi_status = "✅ PASS" if rsi_ok else "❌ FAIL"
-        self.logger.info(f"   📈 RSI 40-60 Range: {rsi_status} | Current: {rsi:.1f} (Range: {rsi_low}-{rsi_high})")
-        
-        # MACD Check
-        macd_status = "✅ PASS" if conditions.get('macd_ok') else "❌ FAIL"
-        macd_hist = conditions.get('macd_hist', 0)
-        macd_delta = conditions.get('macd_delta', 0)
-        self.logger.info(f"   📊 MACD Bullish: {macd_status} | Hist: {macd_hist:.5f} | Delta: {macd_delta:.5f}")
-        
-        # Volume Check
-        vol_status = "✅ PASS" if conditions.get('vol_ratio', 0) > 1.0 else "❌ FAIL"
-        vol_ratio = conditions.get('vol_ratio', 0)
-        self.logger.info(f"   📊 Volume Above MA20: {vol_status} | Ratio: {vol_ratio:.2f}x")
-        
-        # Recent Move Check
-        recent_move = conditions.get('recent_move_pct', 0)
-        move_ok = recent_move <= self.config['max_recent_move_pct']
-        move_status = "✅ PASS" if move_ok else "❌ FAIL"
-        self.logger.info(f"   📈 2H Move <5%: {move_status} | Move: {recent_move:.2f}% (Limit: {self.config['max_recent_move_pct']:.1f}%)")
-        
-        # 15m Confirmation
-        confirm_status = "✅ PASS" if conditions.get('15m_confirm') else "❌ FAIL"
-        self.logger.info(f"   ⏰ 15m Bullish Confirm: {confirm_status}")
-        
-        # Time Block Check
-        time_blocked = conditions.get('time_blocked', False)
-        time_status = "✅ PASS" if not time_blocked else "❌ FAIL"
-        self.logger.info(f"   ⏰ Time Window OK: {time_status}")
-        
-        # Overall Result
-        buy_signal = conditions.get('buy', False)
-        overall_status = "🟢 BUY SIGNAL" if buy_signal else "🔴 NO SIGNAL"
-        reason = conditions.get('reason', 'unknown')
-        self.logger.info(f"   🎯 FINAL RESULT: {overall_status} | Reason: {reason}")
-        self.logger.info(f"   {'='*60}")
+        # Add enhanced data for batch logging
+        enhanced_data = conditions.copy()
+        enhanced_data.update({
+            'ema21_1h': conditions.get('ema21_1h', 0),
+            'ema50_1h': conditions.get('ema50_1h', 0),
+            'ema21_4h': conditions.get('ema21_4h', 0),
+            'ema50_4h': conditions.get('ema50_4h', 0),
+            'vol_ok': conditions.get('vol_ratio', 0) > 0.8,
+        })
+        self._symbol_data_cache.append(enhanced_data)
 
     def check_entry_conditions(self, symbol, dfs):
         """
@@ -451,9 +472,10 @@ class CryptoTradingBot:
                     return {'buy': False, 'reason': 'insufficient_indicators'}
             if pd.isna(prev['ema21']) or pd.isna(prev['ema50']) or pd.isna(last['ema21']) or pd.isna(last['ema50']):
                 return {'buy': False, 'reason': 'insufficient_indicators'}
+            # EMA cross - MODERATE: Just require EMA21 > EMA50 (no fresh cross needed)
             ema_spread_prev = float(prev['ema21'] - prev['ema50'])
             ema_spread_now = float(last['ema21'] - last['ema50'])
-            ma_cross_up = (ema_spread_prev <= 0) and (ema_spread_now > 0)
+            ma_cross_up = ema_spread_now > 0  # Changed: just need EMA21 > EMA50, no cross required
             # 4H confirmation
             last4h = df4h.iloc[-1]
             for col in ['ema21','ema50']:
@@ -480,25 +502,19 @@ class CryptoTradingBot:
             macd_delta = float(macd - macd_sig)
             macd_ok = (macd_delta > 0) and (macd_hist > 0)
 
-            # Volume confirmation
+            # Volume confirmation - MODERATE SETTING
             vol_ratio = float(last.get('vol_ratio', 0.0) or 0.0)
-            vol_ok = vol_ratio > 1.0  # require current volume > vol_ma20 (strict)
+            vol_ok = vol_ratio > 0.8  # Relaxed from 1.0 to 0.8 (80% of average volume)
 
             # 2-hour move check (use 15m series)
             recent_move = self.recent_pct_move(df15, lookback_minutes=120)
             move_ok = recent_move <= self.config['max_recent_move_pct']
 
-            # 15m confirmation
-            confirm15 = self.check_15m_confirmation(df15)
+            # 15m confirmation - MODERATE: Skip this requirement
+            confirm15 = True  # Changed: Always pass 15m confirmation for moderate strategy
 
-            # time-of-day block: avoid first/last 30 minutes of UTC day
-            now = datetime.now(timezone.utc)
-            minute_of_day = now.hour * 60 + now.minute
-            first_30_block = minute_of_day < 30
-            last_30_block = minute_of_day >= (24*60 - 30)
-            time_blocked = first_30_block or last_30_block
-            if time_blocked:
-                return {'buy': False, 'reason': 'time_blocked'}
+            # time-of-day block: MODERATE - Remove time restrictions
+            time_blocked = False  # Changed: Allow trading at all times for moderate strategy
 
             # Aggregate decision
             buy = ma_cross_up and trend_confirm and macd_ok and vol_ok and move_ok and confirm15
@@ -538,7 +554,13 @@ class CryptoTradingBot:
                 '15m_confirm': bool(confirm15),
                 'time_blocked': bool(time_blocked),
                 'price': float(df15['close'].iloc[-1]),
-                'atr_1h': float(df1h['atr14'].iloc[-1]) if 'atr14' in df1h.columns else None
+                'atr_1h': float(df1h['atr14'].iloc[-1]) if 'atr14' in df1h.columns else None,
+                # Enhanced data for detailed logging
+                'ema21_1h': float(last['ema21']) if 'ema21' in df1h.columns else 0,
+                'ema50_1h': float(last['ema50']) if 'ema50' in df1h.columns else 0,
+                'ema21_4h': float(last4h['ema21']) if 'ema21' in df4h.columns else 0,
+                'ema50_4h': float(last4h['ema50']) if 'ema50' in df4h.columns else 0,
+                'vol_ok': bool(vol_ok),
             }
             
             # Log detailed condition check
@@ -917,9 +939,19 @@ class CryptoTradingBot:
         try:
             # Startup message
             mode = "PAPER" if self.config['paper_trading'] else "LIVE"
-            self.logger.info(f"Starting CryptoTradingBot ({mode}) with symbols: {self.config['symbols']}")
+            strategy = "MODERATE"
+            self.logger.info(f"Starting CryptoTradingBot ({mode} - {strategy}) with symbols: {self.config['symbols']}")
+            self.logger.info(f"📊 MODERATE STRATEGY CONFIG:")
+            self.logger.info(f"   RSI Range: {self.config['rsi_entry_low']}-{self.config['rsi_entry_high']} (was 40-60)")
+            self.logger.info(f"   Max Positions: {self.config['max_concurrent_positions']} (was 3)")
+            self.logger.info(f"   Alt Coin Target: {self.config['others_target_pct']:.1%} (was 10%)")
+            self.logger.info(f"   Stop Loss: {self.config['stop_loss_pct']:.1%} (was 2%)")
+            self.logger.info(f"   Recent Move Limit: {self.config['max_recent_move_pct']:.1f}% (was 5%)")
+            self.logger.info(f"   Volume Threshold: 80% of MA20 (was 100%)")
+            self.logger.info(f"   15m Confirmation: DISABLED (was required)")
+            self.logger.info(f"   Time Restrictions: DISABLED (24/7 trading)")
             self.logger.info(f"Position management every {self.config['check_interval']}s, Entry scans every {self.config['entry_scan_interval']}s")
-            self.send_discord_notification(f"🟡 Bot started ({mode}). Symbols: {', '.join(self.config['symbols'])}", color=0x00aa00)
+            self.send_discord_notification(f"🟡 Bot started ({mode} - {strategy}). Symbols: {', '.join(self.config['symbols'])}", color=0x00aa00)
 
             # Calculate how many position management cycles before doing entry scan
             cycles_per_entry_scan = max(1, int(self.config['entry_scan_interval'] / self.config['check_interval']))
@@ -955,6 +987,9 @@ class CryptoTradingBot:
                     # Only scan for new entries every entry_scan_interval
                     signals = []  # Initialize signals for summary
                     if is_entry_scan_cycle:
+                        # Initialize symbol data cache for detailed logging
+                        self._symbol_data_cache = []
+                        
                         # enforce max concurrent positions
                         if len(self.positions) >= self.config['max_concurrent_positions']:
                             self.logger.info(f"Max concurrent positions reached ({len(self.positions)}) - skipping new entries")
@@ -977,6 +1012,12 @@ class CryptoTradingBot:
                                     self.logger.error(f"Signal evaluation error for {symbol}: {e}\n{traceback.format_exc()}")
                                 time.sleep(self.config['rate_limit_sleep'])
 
+                        # Log detailed analysis for all symbols
+                        if hasattr(self, '_symbol_data_cache') and self._symbol_data_cache:
+                            self.log_detailed_analysis(self._symbol_data_cache, cycle_ts)
+
+                        # Continue with execution logic only if we have slots
+                        if len(self.positions) < self.config['max_concurrent_positions']:
                             # Rank signals by simple priority: prefer ones with all_ok and higher vol_ratio
                             ranked = [s for s in signals if s.get('symbol') and s.get('buy')]
                             # also keep those with reason 'all_ok' first

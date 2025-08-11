@@ -6,3 +6,5 @@ bot_state.json
 venv/
 .vscode/
 *.pem
+test_trading_bot.py
+*.ini
