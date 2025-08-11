@@ -54,6 +54,11 @@ class CryptoTradingBot:
         self.peak_balance = 0.0
         self.emergency_stop = False
         self.load_state()
+        
+        # Auto-reset emergency stop on startup with corrected portfolio calculation
+        if self.emergency_stop:
+            self.logger.info("🚨 Emergency stop detected on startup - attempting reset with corrected portfolio calculation")
+            self.reset_emergency_stop()
 
     # ---------------------------
     # Setup & Utilities
@@ -731,10 +736,12 @@ class CryptoTradingBot:
                             if pair_symbol in ['BTC/USD', 'ETH/USD', 'ADA/USD', 'XRP/USD', 'SOL/USD']:
                                 ticker = self.exchange.fetch_ticker(pair_symbol)
                                 if ticker and ticker.get('last') is not None:
-                                    crypto_price = float(ticker['last'])
-                                    crypto_value_usd = crypto_amount * crypto_price
-                                    total_usd += crypto_value_usd
-                                    self.logger.debug(f"{symbol}: {crypto_amount:.6f} @ ${crypto_price:.2f} = ${crypto_value_usd:.2f}")
+                                    last_price = ticker['last']
+                                    if last_price is not None:
+                                        crypto_price = float(last_price)
+                                        crypto_value_usd = crypto_amount * crypto_price
+                                        total_usd += crypto_value_usd
+                                        self.logger.debug(f"{symbol}: {crypto_amount:.6f} @ ${crypto_price:.2f} = ${crypto_value_usd:.2f}")
                         except Exception as e:
                             self.logger.debug(f"Could not get price for {symbol}: {e}")
                             
@@ -1276,11 +1283,4 @@ class CryptoTradingBot:
 
 if __name__ == "__main__":
     bot = CryptoTradingBot()
-    
-    # Temporary: Reset emergency stop if it's active (comment out after first run)
-    if bot.emergency_stop:
-        print("🚨 Emergency stop detected - resetting...")
-        bot.reset_emergency_stop()
-        print("✅ Emergency stop reset - bot will resume normal operation")
-    
     bot.run()
