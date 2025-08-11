@@ -244,30 +244,63 @@ class CryptoTradingBot:
             self.logger.error(f"fetch_ohlcv error {symbol} {timeframe}: {e}")
             return None
 
-    def fetch_multi_tf(self, symbol, limit_1m=1200):
+    def fetch_multi_tf(self, symbol, limit_1m=1440):
         """
-        Fetch 1m and resample to 15m, 1h, 4h.
-        Use limit_1m to gather sufficient history (e.g. 1200 minutes ~ 20 hours).
+        Fetch data for multiple timeframes. Use direct API calls for 1h and 4h,
+        and 1m data for 15m resampling.
         """
         try:
-            self.logger.debug(f"Fetching 1m data for {symbol} limit={limit_1m}")
-            ohlcv = self.exchange.fetch_ohlcv(symbol, '1m', limit=limit_1m)
-            df1 = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df1['timestamp'] = pd.to_datetime(df1['timestamp'], unit='ms')
-            df1.set_index('timestamp', inplace=True)
-            # Resample (use non-deprecated aliases)
-            df15 = df1.resample('15min').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
-            df1h = df1.resample('1h').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
-            df4h = df1.resample('4h').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
-            self.logger.debug(f"Resampled {symbol}: 1m={len(df1)}, 15m={len(df15)}, 1h={len(df1h)}, 4h={len(df4h)}")
-            return {'1m': df1, '15m': df15, '1h': df1h, '4h': df4h}
+            self.logger.debug(f"Fetching multi-timeframe data for {symbol}")
+            
+            # Fetch 1h data directly (need ~60 for EMA50)
+            self.logger.debug(f"Fetching 1h data for {symbol}")
+            ohlcv_1h = self.exchange.fetch_ohlcv(symbol, '1h', limit=100)
+            if not ohlcv_1h or len(ohlcv_1h) < 60:
+                self.logger.warning(f"Insufficient 1h data for {symbol}: {len(ohlcv_1h) if ohlcv_1h else 0}")
+                return None
+            
+            df1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df1h['timestamp'] = pd.to_datetime(df1h['timestamp'], unit='ms')
+            df1h.set_index('timestamp', inplace=True)
+            
+            # Fetch 4h data directly (need ~20 for trend confirmation)
+            self.logger.debug(f"Fetching 4h data for {symbol}")
+            ohlcv_4h = self.exchange.fetch_ohlcv(symbol, '4h', limit=30)
+            if not ohlcv_4h or len(ohlcv_4h) < 20:
+                self.logger.warning(f"Insufficient 4h data for {symbol}: {len(ohlcv_4h) if ohlcv_4h else 0}")
+                return None
+                
+            df4h = pd.DataFrame(ohlcv_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df4h['timestamp'] = pd.to_datetime(df4h['timestamp'], unit='ms')
+            df4h.set_index('timestamp', inplace=True)
+            
+            # Fetch 1m data for 15m resampling and recent price/move calculation
+            self.logger.debug(f"Fetching 1m data for {symbol}")
+            ohlcv_1m = self.exchange.fetch_ohlcv(symbol, '1m', limit=720)  # Last 12 hours
+            if not ohlcv_1m or len(ohlcv_1m) < 240:
+                self.logger.warning(f"Insufficient 1m data for {symbol}: {len(ohlcv_1m) if ohlcv_1m else 0}")
+                return None
+            
+            df1m = pd.DataFrame(ohlcv_1m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df1m['timestamp'] = pd.to_datetime(df1m['timestamp'], unit='ms')
+            df1m.set_index('timestamp', inplace=True)
+            
+            # Resample 1m to 15m
+            df15 = df1m.resample('15min').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna()
+            
+            self.logger.debug(f"Successfully fetched {symbol}: 1m={len(df1m)}, 15m={len(df15)}, 1h={len(df1h)}, 4h={len(df4h)}")
+            return {'1m': df1m, '15m': df15, '1h': df1h, '4h': df4h}
+            
         except Exception as e:
             self.logger.error(f"fetch_multi_tf error for {symbol}: {e}")
+            import traceback
+            self.logger.error(f"fetch_multi_tf traceback: {traceback.format_exc()}")
             return None
 
     def compute_indicators_on_df(self, df):
         """Compute EMA21/50, RSI14, MACD, vol MA20, ATR14 for a DataFrame"""
-        if df is None:
+        if df is None or df.empty:
+            self.logger.warning("compute_indicators_on_df: received None or empty DataFrame")
             return df
         try:
             df = df.copy()
@@ -281,14 +314,23 @@ class CryptoTradingBot:
             if len(df) >= self.config['ema_short']:
                 df['ema21'] = EMAIndicator(df['close'], window=self.config['ema_short']).ema_indicator()
                 computed.append('ema21')
+            else:
+                self.logger.debug(f"Insufficient data for EMA21: {len(df)} < {self.config['ema_short']}")
+            
             # EMA50
             if len(df) >= self.config['ema_long']:
                 df['ema50'] = EMAIndicator(df['close'], window=self.config['ema_long']).ema_indicator()
                 computed.append('ema50')
+            else:
+                self.logger.debug(f"Insufficient data for EMA50: {len(df)} < {self.config['ema_long']}")
+            
             # RSI14
             if len(df) >= self.config['rsi_period'] + 1:
                 df['rsi14'] = RSIIndicator(df['close'], window=self.config['rsi_period']).rsi()
                 computed.append('rsi14')
+            else:
+                self.logger.debug(f"Insufficient data for RSI14: {len(df)} < {self.config['rsi_period'] + 1}")
+            
             # MACD
             macd_min_len = max(self.config['macd_slow'], self.config['macd_signal']) + 1
             if len(df) >= macd_min_len:
@@ -299,20 +341,32 @@ class CryptoTradingBot:
                 df['macd_signal'] = macd.macd_signal()
                 df['macd_hist'] = df['macd'] - df['macd_signal']
                 computed.append('macd')
+            else:
+                self.logger.debug(f"Insufficient data for MACD: {len(df)} < {macd_min_len}")
+            
             # Volume MA and ratio (safe with min_periods=1)
             df['vol_ma20'] = df['volume'].rolling(window=self.config['vol_ma_period'], min_periods=1).mean()
             df['vol_ratio'] = df['volume'] / df['vol_ma20'].replace(0, np.nan)
             computed.append('vol')
+            
             # ATR14
             if len(df) >= self.config['atr_period'] + 1:
                 atr = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=self.config['atr_period'])
                 df['atr14'] = atr.average_true_range()
                 computed.append('atr14')
+            else:
+                self.logger.debug(f"Insufficient data for ATR14: {len(df)} < {self.config['atr_period'] + 1}")
+            
             self.logger.debug(f"Indicators computed (len={len(df)}): {computed}")
-            # Fill forward or drop NaN when needed
+            # Verify we actually have some indicator data
+            if not computed or len([c for c in computed if c != 'vol']) == 0:
+                self.logger.warning(f"No meaningful indicators computed from {len(df)} rows")
+            
             return df
         except Exception as e:
             self.logger.error(f"compute_indicators_on_df error: {e}")
+            import traceback
+            self.logger.error(f"compute_indicators_on_df traceback: {traceback.format_exc()}")
             return df
 
     # ---------------------------
@@ -368,7 +422,7 @@ class CryptoTradingBot:
             
         self.logger.info(f"🔍 DETAILED CRYPTO ANALYSIS @ {cycle_ts}")
         self.logger.info(f"   💰 Balance: ${portfolio_usd:.2f} | Active Positions: {len(self.positions)} | Next Scan: {self.config['entry_scan_interval']}s")
-        self.logger.info(f"   � Open Positions: {list(self.positions.keys()) if self.positions else 'None'}")
+        self.logger.info(f"   📍 Open Positions: {list(self.positions.keys()) if self.positions else 'None'}")
         self.logger.info(f"   {'='*80}")
         
         for data in symbols_data:
@@ -400,17 +454,17 @@ class CryptoTradingBot:
             buy_signal = data.get('buy', False)
             reason = data.get('reason', 'unknown')
             
-            # Format the line
-            signal_icon = "🟢 BUY" if buy_signal else "🔴 NO BUY"
+            # Format the line - match the exact format from your example
+            signal_icon = "🟢 BUY    " if buy_signal else "🔴 NO BUY"
             
-            self.logger.info(f"   {symbol:8s} | {signal_icon:8s} | ${price:8.2f} | "
-                           f"EMA21/50(1h): {ema21_1h:7.2f}/{ema50_1h:7.2f} {'✅' if ma_cross else '❌'} | "
-                           f"EMA21/50(4h): {ema21_4h:7.2f}/{ema50_4h:7.2f} {'✅' if trend_confirm else '❌'}")
+            self.logger.info(f"   {symbol:8s} | {signal_icon} | ${price:11,.2f} | "
+                           f"EMA21/50(1h): {ema21_1h:8.1f}/{ema50_1h:8.1f} {'✅' if ma_cross else '❌'} | "
+                           f"EMA21/50(4h): {ema21_4h:8.1f}/{ema50_4h:8.1f} {'✅' if trend_confirm else '❌'}")
             
-            spacing = " " * 8
+            spacing = " " * 12
             self.logger.info(f"   {spacing} | RSI: {rsi:5.1f} {'✅' if rsi_ok else '❌'} | "
-                           f"MACD: H={macd_hist:6.4f} D={macd_delta:6.4f} {'✅' if macd_ok else '❌'} | "
-                           f"Vol: {vol_ratio:4.2f}x {'✅' if vol_ok else '❌'} | "
+                           f"MACD: H={macd_hist:.4f} D={macd_delta:.4f} {'✅' if macd_ok else '❌'} | "
+                           f"Vol: {vol_ratio:.2f}x {'✅' if vol_ok else '❌'} | "
                            f"Move: {recent_move:4.1f}% {'✅' if move_ok else '❌'}")
             
             if not buy_signal:
@@ -427,6 +481,7 @@ class CryptoTradingBot:
         # Add enhanced data for batch logging
         enhanced_data = conditions.copy()
         enhanced_data.update({
+            'symbol': symbol,  # Ensure symbol is included
             'ema21_1h': conditions.get('ema21_1h', 0),
             'ema50_1h': conditions.get('ema50_1h', 0),
             'ema21_4h': conditions.get('ema21_4h', 0),
@@ -452,7 +507,17 @@ class CryptoTradingBot:
             df4h = dfs.get('4h')
             df15 = dfs.get('15m')
             if df1h is None or df4h is None or df15 is None:
-                return {'buy': False, 'reason': 'missing_data'}
+                # Initialize basic data for logging even on failure
+                conditions_result = {
+                    'buy': False, 'reason': 'missing_data', 'symbol': symbol,
+                    'rsi': 0, 'vol_ratio': 0, 'recent_move_pct': 0,
+                    'ma_cross_up': False, 'trend_confirm': False, 'macd_ok': False,
+                    'ema21_1h': 0, 'ema50_1h': 0, 'ema21_4h': 0, 'ema50_4h': 0,
+                    'macd_hist': 0, 'macd_delta': 0, 'vol_ok': False,
+                    'price': 0
+                }
+                self.log_condition_check(symbol, conditions_result)
+                return conditions_result
 
             # ensure indicators present
             df1h = self.compute_indicators_on_df(df1h)
@@ -461,7 +526,16 @@ class CryptoTradingBot:
 
             # Need at least two 1H candles to detect cross
             if len(df1h) < 2:
-                return {'buy': False, 'reason': 'insufficient_1h'}
+                conditions_result = {
+                    'buy': False, 'reason': 'insufficient_1h', 'symbol': symbol,
+                    'rsi': 0, 'vol_ratio': 0, 'recent_move_pct': 0,
+                    'ma_cross_up': False, 'trend_confirm': False, 'macd_ok': False,
+                    'ema21_1h': 0, 'ema50_1h': 0, 'ema21_4h': 0, 'ema50_4h': 0,
+                    'macd_hist': 0, 'macd_delta': 0, 'vol_ok': False,
+                    'price': 0
+                }
+                self.log_condition_check(symbol, conditions_result)
+                return conditions_result
 
             prev = df1h.iloc[-2]
             last = df1h.iloc[-1]
@@ -469,28 +543,66 @@ class CryptoTradingBot:
             # Guard against missing columns or NaNs in EMA columns
             for col in ['ema21','ema50']:
                 if col not in df1h.columns:
-                    return {'buy': False, 'reason': 'insufficient_indicators'}
+                    conditions_result = {
+                        'buy': False, 'reason': 'insufficient_indicators', 'symbol': symbol,
+                        'rsi': 0, 'vol_ratio': 0, 'recent_move_pct': 0,
+                        'ma_cross_up': False, 'trend_confirm': False, 'macd_ok': False,
+                        'ema21_1h': 0, 'ema50_1h': 0, 'ema21_4h': 0, 'ema50_4h': 0,
+                        'macd_hist': 0, 'macd_delta': 0, 'vol_ok': False,
+                        'price': 0
+                    }
+                    self.log_condition_check(symbol, conditions_result)
+                    return conditions_result
             if pd.isna(prev['ema21']) or pd.isna(prev['ema50']) or pd.isna(last['ema21']) or pd.isna(last['ema50']):
-                return {'buy': False, 'reason': 'insufficient_indicators'}
+                conditions_result = {
+                    'buy': False, 'reason': 'insufficient_indicators', 'symbol': symbol,
+                    'rsi': 0, 'vol_ratio': 0, 'recent_move_pct': 0,
+                    'ma_cross_up': False, 'trend_confirm': False, 'macd_ok': False,
+                    'ema21_1h': 0, 'ema50_1h': 0, 'ema21_4h': 0, 'ema50_4h': 0,
+                    'macd_hist': 0, 'macd_delta': 0, 'vol_ok': False,
+                    'price': 0
+                }
+                self.log_condition_check(symbol, conditions_result)
+                return conditions_result
             # EMA cross - MODERATE: Just require EMA21 > EMA50 (no fresh cross needed)
             ema_spread_prev = float(prev['ema21'] - prev['ema50'])
             ema_spread_now = float(last['ema21'] - last['ema50'])
             ma_cross_up = ema_spread_now > 0  # Changed: just need EMA21 > EMA50, no cross required
-            # 4H confirmation
+            # 4H confirmation - Use available indicators
             last4h = df4h.iloc[-1]
-            for col in ['ema21','ema50']:
-                if col not in df4h.columns:
-                    return {'buy': False, 'reason': 'insufficient_trend_indicators'}
-            if pd.isna(last4h['ema21']) or pd.isna(last4h['ema50']):
-                return {'buy': False, 'reason': 'insufficient_trend_indicators'}
-            trend_spread = float(last4h['ema21'] - last4h['ema50'])
-            trend_confirm = trend_spread > 0
+            
+            # Check if we have EMA50 on 4h, if not use EMA21 vs close or simpler trend
+            if 'ema50' in df4h.columns and not pd.isna(last4h.get('ema50')):
+                # Preferred: EMA21 > EMA50 on 4h
+                if pd.isna(last4h.get('ema21')):
+                    return {'buy': False, 'reason': 'no_4h_ema21'}
+                trend_spread = float(last4h['ema21'] - last4h['ema50'])
+                trend_confirm = trend_spread > 0
+            elif 'ema21' in df4h.columns and not pd.isna(last4h.get('ema21')):
+                # Fallback: EMA21 > current close (bullish)
+                trend_spread = float(last4h['ema21'] - last4h['close'])
+                trend_confirm = trend_spread > 0
+            else:
+                return {'buy': False, 'reason': 'no_4h_trend_indicators'}
             # RSI checks
             rsi = last.get('rsi14', None)
             if rsi is None or math.isnan(rsi):
                 return {'buy': False, 'reason': 'no_rsi'}
             if rsi > self.config['rsi_hard_upper'] or rsi < self.config['rsi_hard_lower']:
-                return {'buy': False, 'reason': f'rsi_out_of_bounds ({rsi:.1f})'}
+                # Log this result before returning so it shows up in detailed analysis
+                conditions_result = {
+                    'buy': False, 'reason': f'rsi_out_of_bounds ({rsi:.1f})', 'symbol': symbol,
+                    'rsi': float(rsi), 'vol_ratio': 0, 'recent_move_pct': 0,
+                    'ma_cross_up': False, 'trend_confirm': trend_confirm, 'macd_ok': False,
+                    'ema21_1h': float(last['ema21']) if 'ema21' in df1h.columns else 0,
+                    'ema50_1h': float(last['ema50']) if 'ema50' in df1h.columns else 0,
+                    'ema21_4h': float(last4h['ema21']) if 'ema21' in df4h.columns else 0,
+                    'ema50_4h': float(last4h['ema50']) if 'ema50' in df4h.columns else 0,
+                    'macd_hist': 0, 'macd_delta': 0, 'vol_ok': False,
+                    'price': float(df15['close'].iloc[-1]) if df15 is not None else 0
+                }
+                self.log_condition_check(symbol, conditions_result)
+                return conditions_result
             if not (self.config['rsi_entry_low'] <= rsi <= self.config['rsi_entry_high']):
                 # allow slightly outside but still not in hard bounds — we'll still reject per spec
                 return {'buy': False, 'reason': f'rsi_not_in_40_60 ({rsi:.1f})'}
@@ -941,15 +1053,6 @@ class CryptoTradingBot:
             mode = "PAPER" if self.config['paper_trading'] else "LIVE"
             strategy = "MODERATE"
             self.logger.info(f"Starting CryptoTradingBot ({mode} - {strategy}) with symbols: {self.config['symbols']}")
-            self.logger.info(f"📊 MODERATE STRATEGY CONFIG:")
-            self.logger.info(f"   RSI Range: {self.config['rsi_entry_low']}-{self.config['rsi_entry_high']} (was 40-60)")
-            self.logger.info(f"   Max Positions: {self.config['max_concurrent_positions']} (was 3)")
-            self.logger.info(f"   Alt Coin Target: {self.config['others_target_pct']:.1%} (was 10%)")
-            self.logger.info(f"   Stop Loss: {self.config['stop_loss_pct']:.1%} (was 2%)")
-            self.logger.info(f"   Recent Move Limit: {self.config['max_recent_move_pct']:.1f}% (was 5%)")
-            self.logger.info(f"   Volume Threshold: 80% of MA20 (was 100%)")
-            self.logger.info(f"   15m Confirmation: DISABLED (was required)")
-            self.logger.info(f"   Time Restrictions: DISABLED (24/7 trading)")
             self.logger.info(f"Position management every {self.config['check_interval']}s, Entry scans every {self.config['entry_scan_interval']}s")
             self.send_discord_notification(f"🟡 Bot started ({mode} - {strategy}). Symbols: {', '.join(self.config['symbols'])}", color=0x00aa00)
 
@@ -999,8 +1102,9 @@ class CryptoTradingBot:
                             
                             for symbol in self.config['symbols']:
                                 try:
-                                    dfs = self.fetch_multi_tf(symbol, limit_1m=720)  # e.g., last 12 hours of 1m bars
+                                    dfs = self.fetch_multi_tf(symbol)  # Use direct timeframe calls
                                     if dfs is None:
+                                        self.logger.warning(f"Failed to fetch data for {symbol} - skipping")
                                         time.sleep(self.config['rate_limit_sleep'])
                                         continue
                                     result = self.check_entry_conditions(symbol, dfs)
@@ -1008,6 +1112,7 @@ class CryptoTradingBot:
                                     result['symbol'] = symbol
                                     result['current_price'] = result.get('price') or (dfs['15m']['close'].iloc[-1] if dfs['15m'] is not None else None)
                                     signals.append(result)
+                                    self.logger.debug(f"Processed signal for {symbol}: {result.get('reason', 'unknown')}")
                                 except Exception as e:
                                     self.logger.error(f"Signal evaluation error for {symbol}: {e}\n{traceback.format_exc()}")
                                 time.sleep(self.config['rate_limit_sleep'])
@@ -1015,6 +1120,9 @@ class CryptoTradingBot:
                         # Log detailed analysis for all symbols
                         if hasattr(self, '_symbol_data_cache') and self._symbol_data_cache:
                             self.log_detailed_analysis(self._symbol_data_cache, cycle_ts)
+                        else:
+                            self.logger.info(f"🔍 DETAILED CRYPTO ANALYSIS @ {cycle_ts}")
+                            self.logger.info(f"    ⚠️ No symbol data cached for detailed analysis")
 
                         # Continue with execution logic only if we have slots
                         if len(self.positions) < self.config['max_concurrent_positions']:
@@ -1065,17 +1173,17 @@ class CryptoTradingBot:
                         buy_signals = [s for s in signals if s.get('buy')]
                         total_evaluated = len(signals)
                         self.logger.info(f"📋 FULL CYCLE SUMMARY:")
-                        self.logger.info(f"   📊 Symbols Evaluated: {total_evaluated}")
-                        self.logger.info(f"   🟢 Buy Signals: {len(buy_signals)}")
-                        self.logger.info(f"   📈 Active Positions: {len(self.positions)} ({list(self.positions.keys())})")
-                        self.logger.info(f"   ⏳ Next entry scan in {self.config['entry_scan_interval']}s")
-                        self.logger.info(f"   {'='*60}")
+                        self.logger.info(f"    📊 Symbols Evaluated: {total_evaluated}")
+                        self.logger.info(f"    🟢 Buy Signals: {len(buy_signals)}")
+                        self.logger.info(f"    📈 Active Positions: {len(self.positions)} ({list(self.positions.keys())})")
+                        self.logger.info(f"    ⏳ Next entry scan in {self.config['entry_scan_interval']}s")
+                        self.logger.info(f"    {'='*60}")
                     else:
                         self.logger.info(f"📋 POSITION MANAGEMENT SUMMARY:")
-                        self.logger.info(f"   📈 Active Positions: {len(self.positions)} ({list(self.positions.keys())})")
+                        self.logger.info(f"    📈 Active Positions: {len(self.positions)} ({list(self.positions.keys())})")
                         remaining_cycles = cycles_per_entry_scan - (cycle_count % cycles_per_entry_scan) - 1
-                        self.logger.info(f"   ⏳ Next entry scan in {remaining_cycles * self.config['check_interval']}s ({remaining_cycles} cycles)")
-                        self.logger.info(f"   {'='*60}")
+                        self.logger.info(f"    ⏳ Next entry scan in {remaining_cycles * self.config['check_interval']}s ({remaining_cycles} cycles)")
+                        self.logger.info(f"    {'='*60}")
                     
                     cycle_count += 1
                     time.sleep(self.config['check_interval'])
