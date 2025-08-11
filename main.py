@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Full Crypto Trading Bot implementing MODERATE STRATEGY:
+Full Crypto Trading Bot implementing AGGRESSIVE STRATEGY:
 - EMA21 > EMA50 on 1H (no cross required) with 4H confirmation
-- RSI14 between 30-70 (relaxed from 40-60), MACD(12,26,9), Volume >80% MA20, ATR14
+- RSI14 between 30-70 (relaxed from 40-60), MACD(12,26,9) with relaxed negative tolerance in strong trends, Volume >60% MA20, ATR14
 - No 15m confirmation required (moderate)
 - Position sizing with BTC/ETH min $16, ADA/XRP/SOL target 15% each
 - Max 5 concurrent positions (increased from 3), larger position caps 25%
@@ -10,6 +10,7 @@ Full Crypto Trading Bot implementing MODERATE STRATEGY:
 - No time window restrictions (24/7 trading)
 - Discord notifications, bot_state.json persistence, comprehensive logging
 - Market orders for execution (paper trading supported)
+- AGGRESSIVE FEATURES: Lower volume threshold (60%), MACD tolerance in strong trends
 """
 
 import ccxt
@@ -439,6 +440,7 @@ class CryptoTradingBot:
             macd_delta = data.get('macd_delta', 0)
             vol_ratio = data.get('vol_ratio', 0)
             recent_move = data.get('recent_move_pct', 0)
+            strong_trend = data.get('strong_trend', False)
             
             # Condition checks
             ma_cross = data.get('ma_cross_up', False)
@@ -462,9 +464,12 @@ class CryptoTradingBot:
                            f"EMA21/50(4h): {ema21_4h:8.1f}/{ema50_4h:8.1f} {'✅' if trend_confirm else '❌'}")
             
             spacing = " " * 12
+            macd_indicator = "🚀" if strong_trend and not macd_ok else ("✅" if macd_ok else "❌")
+            vol_indicator = "✅" if vol_ok else "❌"
+            
             self.logger.info(f"   {spacing} | RSI: {rsi:5.1f} {'✅' if rsi_ok else '❌'} | "
-                           f"MACD: H={macd_hist:.4f} D={macd_delta:.4f} {'✅' if macd_ok else '❌'} | "
-                           f"Vol: {vol_ratio:.2f}x {'✅' if vol_ok else '❌'} | "
+                           f"MACD: H={macd_hist:.4f} D={macd_delta:.4f} {macd_indicator} | "
+                           f"Vol: {vol_ratio:.2f}x {vol_indicator} | "
                            f"Move: {recent_move:4.1f}% {'✅' if move_ok else '❌'}")
             
             if not buy_signal:
@@ -486,7 +491,8 @@ class CryptoTradingBot:
             'ema50_1h': conditions.get('ema50_1h', 0),
             'ema21_4h': conditions.get('ema21_4h', 0),
             'ema50_4h': conditions.get('ema50_4h', 0),
-            'vol_ok': conditions.get('vol_ratio', 0) > 0.8,
+            'vol_ok': conditions.get('vol_ratio', 0) > 0.6,  # Updated threshold
+            'strong_trend': conditions.get('strong_trend', False),
         })
         self._symbol_data_cache.append(enhanced_data)
 
@@ -607,16 +613,26 @@ class CryptoTradingBot:
                 # allow slightly outside but still not in hard bounds — we'll still reject per spec
                 return {'buy': False, 'reason': f'rsi_not_in_40_60 ({rsi:.1f})'}
 
-            # MACD check
+            # MACD check - AGGRESSIVE SETTING
             macd = float(last.get('macd', 0.0) or 0.0)
             macd_sig = float(last.get('macd_signal', 0.0) or 0.0)
             macd_hist = float(last.get('macd_hist', macd - macd_sig) or 0.0)
             macd_delta = float(macd - macd_sig)
-            macd_ok = (macd_delta > 0) and (macd_hist > 0)
+            
+            # Allow slightly negative MACD in strong trends (when EMA21 > EMA50 by significant margin)
+            ema_strength = (ema_spread_now / last['ema50']) if last['ema50'] > 0 else 0
+            strong_trend = ema_strength > 0.02  # EMA21 is 2%+ above EMA50
+            
+            if strong_trend:
+                # In strong trends, allow MACD histogram down to -20% of recent range
+                macd_ok = macd_delta > -0.001 or (macd_hist > -abs(macd_delta) * 0.2)
+            else:
+                # Normal conditions: require positive MACD
+                macd_ok = (macd_delta > 0) and (macd_hist > 0)
 
-            # Volume confirmation - MODERATE SETTING
+            # Volume confirmation - AGGRESSIVE SETTING
             vol_ratio = float(last.get('vol_ratio', 0.0) or 0.0)
-            vol_ok = vol_ratio > 0.8  # Relaxed from 1.0 to 0.8 (80% of average volume)
+            vol_ok = vol_ratio > 0.6  # Relaxed from 0.8 to 0.6 (60% of average volume)
 
             # 2-hour move check (use 15m series)
             recent_move = self.recent_pct_move(df15, lookback_minutes=120)
@@ -673,6 +689,7 @@ class CryptoTradingBot:
                 'ema21_4h': float(last4h['ema21']) if 'ema21' in df4h.columns else 0,
                 'ema50_4h': float(last4h['ema50']) if 'ema50' in df4h.columns else 0,
                 'vol_ok': bool(vol_ok),
+                'strong_trend': bool(strong_trend),
             }
             
             # Log detailed condition check
@@ -1051,7 +1068,7 @@ class CryptoTradingBot:
         try:
             # Startup message
             mode = "PAPER" if self.config['paper_trading'] else "LIVE"
-            strategy = "MODERATE"
+            strategy = "AGGRESSIVE"
             self.logger.info(f"Starting CryptoTradingBot ({mode} - {strategy}) with symbols: {self.config['symbols']}")
             self.logger.info(f"Position management every {self.config['check_interval']}s, Entry scans every {self.config['entry_scan_interval']}s")
             self.send_discord_notification(f"🟡 Bot started ({mode} - {strategy}). Symbols: {', '.join(self.config['symbols'])}", color=0x00aa00)
