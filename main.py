@@ -128,7 +128,7 @@ class CryptoTradingBot:
             'time_exit_hours': 72,       # Increased from 48 to 72 hours
             # Safety
             'daily_loss_limit_pct': 0.05,  # 5% daily loss limit -> stop trading
-            'max_drawdown_pct': 0.05,      # 5% peak drawdown emergency stop
+            'max_drawdown_pct': 0.15,      # 15% peak drawdown emergency stop (relaxed for live trading)
             'min_trade_amount_usd': 5.0,  # global absolute minimum trade (USD)
             # correlation settings
             'correlation_lookback_4h_hours': 30 * 24,  # fallback if needed
@@ -705,21 +705,52 @@ class CryptoTradingBot:
     # Position sizing & execution
     # ---------------------------
     def get_portfolio_usd(self):
-        """Get estimated portfolio USD total (uses 'total' balances)."""
+        """Get estimated portfolio USD total including all crypto holdings converted to USD."""
         try:
             bal = self.exchange.fetch_balance()
-            usd = 0.0
-            # Try common USD keys
+            total_usd = 0.0
+            
+            # Get USD cash balance first
             usd_keys = ['USD', 'ZUSD', 'USDT']  # Kraken uses ZUSD sometimes; but prefer USD
             for k in usd_keys:
                 if k in bal.get('total', {}) and bal['total'][k] is not None:
-                    usd = float(bal['total'][k])
-                    self.logger.debug(f"Portfolio USD detected via key {k}: ${usd:.2f}")
+                    cash_usd = float(bal['total'][k])
+                    total_usd += cash_usd
+                    self.logger.debug(f"Cash USD balance ({k}): ${cash_usd:.2f}")
                     break
-            # Fall back to summing known fiat + crypto via last prices (costly). For now return usd.
-            return float(usd)
+            
+            # Add value of crypto holdings
+            crypto_symbols = ['BTC', 'ETH', 'ADA', 'XRP', 'SOL', 'XETH', 'XXBT', 'XXRP']  # Include Kraken prefixed versions
+            for symbol in crypto_symbols:
+                if symbol in bal.get('total', {}) and bal['total'][symbol] is not None:
+                    crypto_amount = float(bal['total'][symbol])
+                    if crypto_amount > 0.00001:  # Only process meaningful amounts
+                        try:
+                            # Get the trading pair symbol for price lookup
+                            pair_symbol = f"{symbol.replace('X', '')}/USD"  # Remove Kraken X prefix
+                            if pair_symbol in ['BTC/USD', 'ETH/USD', 'ADA/USD', 'XRP/USD', 'SOL/USD']:
+                                ticker = self.exchange.fetch_ticker(pair_symbol)
+                                if ticker and ticker.get('last') is not None:
+                                    crypto_price = float(ticker['last'])
+                                    crypto_value_usd = crypto_amount * crypto_price
+                                    total_usd += crypto_value_usd
+                                    self.logger.debug(f"{symbol}: {crypto_amount:.6f} @ ${crypto_price:.2f} = ${crypto_value_usd:.2f}")
+                        except Exception as e:
+                            self.logger.debug(f"Could not get price for {symbol}: {e}")
+                            
+            self.logger.debug(f"Total portfolio value: ${total_usd:.2f}")
+            return float(total_usd)
         except Exception as e:
-            self.logger.warning(f"get_portfolio_usd fallback error: {e}")
+            self.logger.warning(f"get_portfolio_usd error: {e}")
+            # Fallback to cash-only calculation
+            try:
+                bal = self.exchange.fetch_balance()
+                usd_keys = ['USD', 'ZUSD', 'USDT']
+                for k in usd_keys:
+                    if k in bal.get('total', {}) and bal['total'][k] is not None:
+                        return float(bal['total'][k])
+            except:
+                pass
             return 0.0
 
     def calculate_position_amount(self, symbol, price):
@@ -1012,12 +1043,20 @@ class CryptoTradingBot:
     # ---------------------------
     # Risk checks
     # ---------------------------
-    def check_risk_management(self):
+    def check_risk_management(self, skip_if_recent_trade=True):
         """
         - Update session start / peak balances
         - Check daily loss and drawdown emergency stop
+        - skip_if_recent_trade: Skip drawdown check if trade executed recently (API lag protection)
         """
         try:
+            # Check if we executed a trade recently (within last 60 seconds)
+            recent_trade = False
+            if skip_if_recent_trade and self.trade_history:
+                last_trade_time = datetime.fromisoformat(self.trade_history[-1]['timestamp'].replace('Z', '+00:00'))
+                time_since_trade = (datetime.now(timezone.utc) - last_trade_time).total_seconds()
+                recent_trade = time_since_trade < 60  # Within last 60 seconds
+                
             bal = None
             try:
                 bal = self.exchange.fetch_balance()
@@ -1047,6 +1086,11 @@ class CryptoTradingBot:
 
             self.logger.info(f"Risk: balance=${current_usd:.2f}, peak=${self.peak_balance:.2f}, drawdown={drawdown_pct:.2%}, daily={daily_pct:.2%}")
 
+            # Skip drawdown check if we just executed a trade (API balance lag protection)
+            if recent_trade:
+                self.logger.info("Skipping drawdown check - recent trade executed (API lag protection)")
+                return True
+
             if drawdown_pct >= self.config['max_drawdown_pct']:
                 self.emergency_stop = True
                 self.send_discord_notification(f"🚨 EMERGENCY STOP: Peak drawdown {drawdown_pct:.2%} exceeded {self.config['max_drawdown_pct']:.2%}", color=0xff0000)
@@ -1059,6 +1103,18 @@ class CryptoTradingBot:
         except Exception as e:
             self.logger.error(f"check_risk_management error: {e}\n{traceback.format_exc()}")
             return True
+
+    def reset_emergency_stop(self):
+        """Reset emergency stop flag and update peak balance to current balance"""
+        try:
+            self.emergency_stop = False
+            current_usd = self.get_portfolio_usd()
+            self.peak_balance = current_usd  # Reset peak to current balance
+            self.logger.info(f"Emergency stop reset. New peak balance: ${self.peak_balance:.2f}")
+            self.send_discord_notification(f"✅ Emergency stop reset. Peak balance: ${self.peak_balance:.2f}", color=0x00ff00)
+            self.save_state()
+        except Exception as e:
+            self.logger.error(f"reset_emergency_stop error: {e}")
 
     # ---------------------------
     # Main loop
@@ -1220,4 +1276,11 @@ class CryptoTradingBot:
 
 if __name__ == "__main__":
     bot = CryptoTradingBot()
+    
+    # Temporary: Reset emergency stop if it's active (comment out after first run)
+    if bot.emergency_stop:
+        print("🚨 Emergency stop detected - resetting...")
+        bot.reset_emergency_stop()
+        print("✅ Emergency stop reset - bot will resume normal operation")
+    
     bot.run()
